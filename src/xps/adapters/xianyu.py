@@ -31,7 +31,7 @@ from xps.adapters.base import (
     PageOutcome,
     RawListing,
 )
-from xps.errors import UpstreamError
+from xps.errors import HALT_CODES, UpstreamError
 from xps.services.identity import resolve_identity
 
 logger = logging.getLogger(__name__)
@@ -266,7 +266,6 @@ class XianyuUpstreamAdapter:
             city=city,
         )
 
-        listings: list[RawListing] = []
         outcomes: list[PageOutcome] = []
         warnings: list[str] = []
         has_next: bool | None = None
@@ -278,44 +277,40 @@ class XianyuUpstreamAdapter:
 
             if has_next is False:
                 outcomes.append(
-                    PageOutcome(page, False, 0, "NO_MORE_PAGES", "平台报告没有下一页")
+                    PageOutcome(page, False, (), "NO_MORE_PAGES", "平台报告没有下一页")
                 )
                 warnings.append(f"page_{page}_not_available:hasNextPage=false")
                 continue
 
             try:
                 raw = await self._mtop.search(keyword, page, filters=filters)
-            except UpstreamError:
-                raise
             except Exception as exc:
                 code, message = _classify_upstream_exception(exc)
-                outcomes.append(PageOutcome(page, False, 0, code, message))
+                outcomes.append(PageOutcome(page, False, (), code, message))
                 warnings.append(f"page_{page}_failed:{code}")
-                if code in {"CHALLENGE_REQUIRED", "RATE_LIMITED", "AUTH_REQUIRED"}:
-                    # 风控/验证/需登录：立即停止，不继续撞
+                if code in HALT_CODES:
+                    # 风控 / 验证码 / 需登录：立即停止，不继续撞（指南 §9）
                     break
                 continue
 
             info = result_info(raw)
             has_next = info.get("hasNextPage")
-            page_listings = extract_listings(raw)
-            outcomes.append(PageOutcome(page, True, len(page_listings)))
-            listings.extend(page_listings)
+            page_listings = tuple(extract_listings(raw))
+            outcomes.append(PageOutcome(page, True, page_listings))
 
             if not page_listings:
                 control = info.get("searchResControlFields") or {}
                 if control.get("hasItems") is False:
+                    # 经核验的真实空结果，区别于上游失败
                     warnings.append(f"page_{page}_verified_empty")
                 else:
                     warnings.append(f"page_{page}_empty_but_platform_says_has_items")
 
         return CrawlResult(
-            listings=tuple(listings),
             auth_mode=auth.state,
             pages_requested=max_pages,
-            pages_fetched=sum(1 for outcome in outcomes if outcome.fetched),
-            warnings=tuple(warnings),
             pages=tuple(outcomes),
+            warnings=tuple(warnings),
             has_next_page=has_next,
         )
 

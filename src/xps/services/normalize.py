@@ -78,6 +78,13 @@ class PriceParse:
     currency: str | None
 
 
+def fen_to_yuan(fen: int | None) -> str | None:
+    """分 → 保留两位的人民币字符串。金额以字符串出 API，避免 JSON 浮点失真。"""
+    if fen is None:
+        return None
+    return str((Decimal(fen) / _HUNDRED).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
 def _to_decimal(text: str) -> Decimal | None:
     multiplier = Decimal(1)
     working = text

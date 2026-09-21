@@ -29,6 +29,12 @@ addopts = '-m "not live"'
 markers = [
     "live: 真实访问闲鱼的集成测试；默认排除，需 `-m live` 显式触发，低频手动运行",
 ]
+# 以下两条是 starlette/anyio 内部的弃用告警，与本项目代码无关，屏蔽以保持输出干净。
+# 本项目自身产生的告警不会被屏蔽。
+filterwarnings = [
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+    "ignore:The anyio.abc.BlockingPortal alias is deprecated",
+]
 
 [tool.ruff]
 line-length = 100

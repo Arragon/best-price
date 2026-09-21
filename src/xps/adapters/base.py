@@ -43,24 +43,34 @@ class RawListing:
 
 @dataclass(frozen=True)
 class PageOutcome:
-    """逐页成败。scrape_xianyu_http 的 gather 拿不到这个粒度，故自行逐页采集。"""
+    """逐页成败与该页商品。scrape_xianyu_http 的 gather 拿不到这个粒度，故自行逐页采集。"""
 
     page: int
     fetched: bool
-    item_count: int
+    listings: tuple[RawListing, ...] = ()
     error_code: str | None = None
     error_message: str | None = None
+
+    @property
+    def item_count(self) -> int:
+        return len(self.listings)
 
 
 @dataclass(frozen=True)
 class CrawlResult:
-    listings: tuple[RawListing, ...]
     auth_mode: str
     pages_requested: int
-    pages_fetched: int
-    warnings: tuple[str, ...]
-    pages: tuple[PageOutcome, ...] = ()
+    pages: tuple[PageOutcome, ...]
+    warnings: tuple[str, ...] = ()
     has_next_page: bool | None = None
+
+    @property
+    def listings(self) -> tuple[RawListing, ...]:
+        return tuple(listing for page in self.pages for listing in page.listings)
+
+    @property
+    def pages_fetched(self) -> int:
+        return sum(1 for page in self.pages if page.fetched)
 
 
 @dataclass(frozen=True)

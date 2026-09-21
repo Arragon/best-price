@@ -88,6 +88,14 @@ def http_status(code: str) -> int:
     return _HTTP_STATUS.get(code, 500)
 
 
+def is_retryable(code: str) -> bool:
+    return _RETRYABLE.get(code, False)
+
+
+def requires_human(code: str) -> bool:
+    return _REQUIRES_HUMAN.get(code, False)
+
+
 class ServiceError(Exception):
     """带机器可读错误码的业务异常。"""
 
@@ -99,6 +107,7 @@ class ServiceError(Exception):
         run_id: str | None = None,
         retryable: bool | None = None,
         requires_human_action: bool | None = None,
+        status_code: int | None = None,
     ) -> None:
         super().__init__(message)
         if code not in ALL_CODES:
@@ -110,10 +119,12 @@ class ServiceError(Exception):
         self.requires_human_action = (
             _REQUIRES_HUMAN[code] if requires_human_action is None else requires_human_action
         )
+        self._status_code = status_code
 
     @property
     def status_code(self) -> int:
-        return http_status(self.code)
+        # 允许覆盖：例如 run_id 不存在语义上是 INVALID_QUERY，但 HTTP 应当是 404
+        return self._status_code or http_status(self.code)
 
     def to_body(self) -> dict[str, object]:
         return {
