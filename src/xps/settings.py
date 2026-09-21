@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     xianyu_upstream_path: Path = DEFAULT_UPSTREAM_PATH
     # 落库到 search_runs.source_commit，用于事后判断某轮数据是哪个上游版本抓的
     xianyu_source_commit: str | None = None
+    # scripts/setup.sh 写入；显式配置优先于此文件
+    upstream_commit_file: Path = Path("data/upstream-commit.txt")
 
     max_search_pages: int = 3
     max_concurrent_searches: int = 1
@@ -69,3 +71,13 @@ class Settings(BaseSettings):
         if self.min_sample_threshold < 2:
             raise ValueError("min_sample_threshold 必须 >= 2")
         return self
+
+    def resolved_source_commit(self) -> str | None:
+        """显式配置优先；否则读 setup.sh 记录的文件；都没有就返回 None，不猜。"""
+        if self.xianyu_source_commit:
+            return self.xianyu_source_commit
+        try:
+            recorded = self.upstream_commit_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        return recorded or None

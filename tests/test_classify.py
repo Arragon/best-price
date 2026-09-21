@@ -171,6 +171,147 @@ def test_negated_repair_words_are_not_faults(title: str) -> None:
     assert REPAIR_OR_FAULT not in flags_of(title)
 
 
+# ------------------------------------------------- 真实数据回归（2026-09-22 实测）
+#
+# 以下标题均为真实抓取的公开挂牌文本。它们暴露了两类误删：
+# 裸子串匹配把「无拆修」这类**正面声明**、以及质保/租赁样板文案里的
+# 故障词当成故障；把附带清单里提到的配件当成「只卖配件」。
+# 保留原文是为了让这两类误判永远无法悄悄回归。
+
+REAL_NO_REPAIR_BODY = (
+    "富士X-T4银色微单机身，成色如图，轻微使用痕迹，功能正常， 无拆修，"
+    "CMOS干净，按键灵敏，屏幕显示完好，适合进阶玩家或日常拍摄。配件：原装电池、双充、肩"
+)
+REAL_WARRANTY_CLAUSE = (
+    "富士X-T4 95新 店铺质保 】支持(人为损坏、进水进液和自然使用老化和外观磨损)包邮退"
+)
+REAL_RENTAL_BOILERPLATE = (
+    "索尼a7m4免押租赁 妥善使用：合理爱惜器材，避免磕碰、受潮、进水等人为损耗，"
+    "人为损坏需承担对应检修成本"
+)
+REAL_BODY_WITH_ACCESSORY_LIST = (
+    "富士X-T4 复古微单相机 xt4 外观轻微使用痕迹，成色如图， 实物拍摄， 各功能一切正常，"
+    "按键灵敏，无拆无修无暗病无进水。 配件:品牌电池2块 充电器 手带 机身盖广州本地支持地铁面交"
+)
+REAL_BODY_LATE_ACCESSORIES = (
+    "富士X-T4 国行 99新 仅上海面交 快门几百次 就出去旅游拍过2次外观成色如新卡口如新 "
+    "极品成色全套包装配件都在送国产皮套一个上海面交自提外地不发"
+)
+REAL_RECYCLING_SERVICE = (
+    "相机回收上门服务 数码相机回收微单相机回收单电相机回收运动相机#上门回收 相机回收相机价高公道，"
+    "全城24小时高价回收相机、回收单反相机、回收大疆无人机、回收微单相机、回收相机镜头"
+)
+REAL_ACCESSORY_BATTERY = (
+    "几乎全新！两块沣标FB-NP-FW50(G)相机电池，索尼相机系列专用，充电方便，续航很给力"
+    "电池没鼓包，电量满格，功能一切正常，买来没怎么用，闲置转让"
+)
+
+
+@pytest.mark.parametrize(
+    "title", [REAL_NO_REPAIR_BODY, REAL_WARRANTY_CLAUSE, REAL_RENTAL_BOILERPLATE]
+)
+def test_real_listings_with_negated_or_boilerplate_fault_words_are_not_faults(
+    title: str,
+) -> None:
+    """「无拆修」是正面声明；质保条款与租赁须知里列举的故障词不是在说本机。"""
+    assert REPAIR_OR_FAULT not in flags_of(title)
+
+
+def test_real_body_listing_with_accessory_list_is_not_accessory_only() -> None:
+    """¥5100 的真整机曾被误判为配件。配件出现在「配件:」清单里，不是在卖配件。"""
+    result = classify(REAL_BODY_WITH_ACCESSORY_LIST, spec=XT4)
+
+    assert ACCESSORY_ONLY not in result.flags
+    assert result.excluded is False
+
+
+def test_real_body_listing_with_late_accessories_is_not_accessory_only() -> None:
+    """¥5200 的真整机：「全套包装配件都在送国产皮套」是赠品说明。"""
+    result = classify(REAL_BODY_LATE_ACCESSORIES, spec=XT4)
+
+    assert ACCESSORY_ONLY not in result.flags
+    assert result.excluded is False
+
+
+def test_real_recycling_service_is_wanted_not_accessory() -> None:
+    """¥6589 的回收上门服务：该判求购，不该判配件。"""
+    result = classify(REAL_RECYCLING_SERVICE, spec=XT4)
+
+    assert ACCESSORY_ONLY not in result.flags
+    assert WANTED_TO_BUY in result.flags
+    assert result.excluded is True
+
+
+def test_real_battery_listing_is_still_accessory_only() -> None:
+    """回归护栏：修 accessory_only 不能把真配件放过去。"""
+    result = classify(REAL_ACCESSORY_BATTERY, spec=XT4)
+
+    assert ACCESSORY_ONLY in result.flags
+    assert result.excluded is True
+
+
+# ------------------------------------------- 弱/强信号与外观描述（真实数据回归 2）
+
+REAL_KIT_WITH_COSMETIC_BODY_WORD = (
+    "配件多富士X-T4微单套机成色新带16-80mm镜头，镜片无痕，无霉，成色如图，"
+    "机身外观轻微使用痕迹，功能一切正常，无拆修，性能稳定，菜单支持中文"
+)
+REAL_DUAL_PRICE_LISTING = (
+    "几乎全新富士XT4银色国行，箱说全，功能完好无修，单机+原厂配件+原厂电池。"
+    "性能画质造型都碾压XS系列。单机身5499，套机6299包邮，支持自提"
+)
+REAL_BODY_WITH_COSMETIC_IMAGE_DEFERRAL = (
+    "富士X-T4微单机身，黑色，适合日常扫街、旅游、Vlog，功能正常，CMOS干净无坏点，"
+    "成色看图，如图所见"
+)
+
+
+def test_cosmetic_image_deferral_does_not_override_a_determined_kind() -> None:
+    """「成色如图」「看图」说的是**外观**，不是在隐瞒型号或配置。
+
+    二手相机挂牌里这类措辞几乎无处不在；若据此一律进 review，
+    合格样本会被抽空（实测 8 件正常整机全部被推去 review）。
+    """
+    result = classify(REAL_BODY_WITH_COSMETIC_IMAGE_DEFERRAL, spec=XT4)
+
+    assert result.item_kind == BODY
+    assert result.needs_review is False
+    assert result.excluded is False
+
+
+def test_kit_signal_wins_over_a_descriptive_body_word() -> None:
+    """[实测] ¥7299：「微单套机…带16-80mm镜头…机身外观轻微使用痕迹」是套机。
+
+    「机身外观」只是外观描述，不构成单机身信号，不该与「套机」判成冲突。
+    """
+    result = classify(REAL_KIT_WITH_COSMETIC_BODY_WORD, spec=XT4)
+
+    assert result.item_kind == KIT
+    assert BUNDLE in result.flags
+    assert result.needs_review is False
+    assert result.excluded is False
+
+
+def test_conflicting_body_and_kit_prices_still_go_to_review() -> None:
+    """[实测] ¥5499：「单机身5499，套机6299包邮」两个价都写在标题里。
+
+    规则无法确定挂牌价对应哪个配置 —— 诚实地进 review，不硬猜。
+    """
+    result = classify(REAL_DUAL_PRICE_LISTING, spec=XT4)
+
+    assert result.item_kind is None
+    assert result.needs_review is True
+    assert result.excluded is False
+
+
+def test_explicit_body_word_still_conflicts_with_kit() -> None:
+    """「单机+套机都出」是真正的配置冲突，与「机身外观」那种描述性用法要区分开。"""
+    result = classify("富士 X-T4 单机+套机都出", spec=XT4)
+
+    assert result.item_kind is None
+    assert result.needs_review is True
+
+
 # ---------------------------------------------------------------- 求购（非卖盘）
 
 

@@ -501,3 +501,51 @@ def test_settings_default_to_loopback() -> None:
 
     assert settings.app_host == "127.0.0.1"
     assert settings.max_search_pages == 3
+
+
+def test_settings_refuse_concurrent_searches() -> None:
+    """SQLite 单写者 + 低频访问平台；配错了要立刻炸，不能静默忽略。"""
+    with pytest.raises(ValueError, match="max_concurrent_searches"):
+        Settings(max_concurrent_searches=4, _env_file=None)
+
+
+# ---------------------------------------------------------------- 采集来源可追溯
+
+
+def test_source_commit_falls_back_to_the_recorded_file(tmp_path) -> None:
+    """§6：search_runs.source_commit 用于事后判断某轮数据是哪个上游版本抓的。"""
+    commit_file = tmp_path / "upstream-commit.txt"
+    commit_file.write_text("eb52bd4d1901eee9ba8035e860583cddf50ead4c\n", encoding="utf-8")
+
+    settings = Settings(upstream_commit_file=commit_file, _env_file=None)
+
+    assert settings.resolved_source_commit() == "eb52bd4d1901eee9ba8035e860583cddf50ead4c"
+
+
+def test_explicit_source_commit_wins_over_the_file(tmp_path) -> None:
+    commit_file = tmp_path / "upstream-commit.txt"
+    commit_file.write_text("from-file\n", encoding="utf-8")
+
+    settings = Settings(
+        xianyu_source_commit="from-env", upstream_commit_file=commit_file, _env_file=None
+    )
+
+    assert settings.resolved_source_commit() == "from-env"
+
+
+def test_missing_commit_file_yields_none_not_a_guess(tmp_path) -> None:
+    settings = Settings(upstream_commit_file=tmp_path / "nope.txt", _env_file=None)
+
+    assert settings.resolved_source_commit() is None
+
+
+def test_run_response_exposes_provenance(tmp_path) -> None:
+    commit_file = tmp_path / "upstream-commit.txt"
+    commit_file.write_text("abc123\n", encoding="utf-8")
+    adapter = FakeAdapter(pages=[body_listings(7001, 2)])
+
+    with build_client(tmp_path, adapter, upstream_commit_file=commit_file) as test_client:
+        run = search_and_wait(test_client)
+
+    assert run["source_commit"] == "abc123"
+    assert run["adapter_version"]

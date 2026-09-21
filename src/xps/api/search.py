@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 
-from xps.api.deps import get_repo, get_service, load_run, run_error_body
+from xps.api.deps import get_repo, get_service, get_settings, load_run, run_error_body
 from xps.api.schemas import SearchAccepted, SearchRunResponse, SearchSubmitRequest
-from xps.errors import UNSUPPORTED_FILTER, ServiceError
+from xps.errors import INVALID_QUERY, UNSUPPORTED_FILTER, ServiceError
 from xps.services.search_service import SearchRequest
+from xps.settings import Settings
 from xps.storage.repository import Repository
 
 router = APIRouter(prefix="/v1", tags=["search"])
@@ -26,7 +27,15 @@ router = APIRouter(prefix="/v1", tags=["search"])
 async def submit_search(
     payload: SearchSubmitRequest,
     service=Depends(get_service),
+    settings: Settings = Depends(get_settings),
 ) -> SearchAccepted:
+    if payload.max_pages > settings.max_search_pages:
+        raise ServiceError(
+            INVALID_QUERY,
+            f"max_pages={payload.max_pages} 超过上限 {settings.max_search_pages}"
+            "（MAX_SEARCH_PAGES 可调，默认保守）",
+        )
+
     unverified = payload.unverified_filters()
     if unverified:
         # §8.1：未经验证支持的搜索条件必须显式拒绝，不能暗称已由平台过滤
@@ -76,4 +85,6 @@ async def get_search_run(
         ended_at=run.ended_at,
         warnings=list(run.warnings),
         error=run_error_body(run),  # type: ignore[arg-type]
+        adapter_version=run.adapter_version,
+        source_commit=run.source_commit,
     )

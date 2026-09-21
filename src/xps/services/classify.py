@@ -81,7 +81,10 @@ _ACCESSORY_HINTS = (
     "滤镜",
 )
 
-_BODY_HINTS = ("单机身", "单机", "机身", "主机", "裸机", "本体")
+# 「机身」单独出现常是外观描述（实测「机身外观轻微使用痕迹」出现在套机挂牌里），
+# 因此与「单机/裸机」这类明确的单机身措辞区分强弱。
+_BODY_STRONG = ("单机身", "单机", "裸机", "主机", "本体")
+_BODY_WEAK = ("机身",)
 
 # 只认明确的套机措辞。「18-55」这类焦段本身是镜头标记，单出镜头时会造成误判，故不列入。
 _KIT_HINTS = ("套机", "套装", "双镜头", "套镜头", "KIT")
@@ -107,6 +110,20 @@ _FAULT_HINTS = (
     "坏了",
 )
 
+# 故障词做裸子串匹配会大面积误删正常整机（2026-09-22 实测：60 条里误伤 4 条）。
+# 两类语境必须排除：
+#   否定式 —— 「无拆修」「无拆无修无暗病无进水」是卖家在声明**没有**这些问题
+#   枚举式 —— 「避免磕碰、受潮、进水等」「支持(人为损坏、进水进液…)」是租赁须知
+#              与质保条款里的通用列举，不是在说本机状况
+_FAULT_NEGATIONS = ("无", "没", "未", "非", "免")
+_FAULT_NEGATION_WINDOW = 4
+_ENUMERATION_SEPARATORS = "、，,/／·"
+
+# 配件词只在标题开头这段「卖家自述这是什么」的范围内才算数。
+# 真整机常在后面列附带清单（「配件:品牌电池2块 充电器」「全套包装配件都在送皮套」），
+# 而真配件（「两块沣标…相机电池」）一定在开头就点明。
+_HEADLINE_WINDOW = 40
+
 _RENTAL_HINTS = ("租赁", "出租", "日租", "月租", "免押", "跟拍", "租")
 
 _WANTED_PHRASES = (
@@ -126,9 +143,6 @@ _WANTED_LEADING = re.compile(r"^收(?![纳录获益得回藏款货件])")
 _DEPOSIT_HINTS = ("定金", "订金", "押金", "占位", "补差价", "差价", "专拍", "一元", "1元")
 
 _VARIANT_HINTS = ("银色", "黑色", "白色", "灰色", "国行", "日版", "港版", "美版", "官翻")
-
-# 卖家把规格推给图片时，不得由模型把图片内容当已核实事实（指南 §7）
-_IMAGE_DEFERRAL_HINTS = ("详情见图", "详见图", "见图", "看图", "如图", "图片为准")
 
 # 只删连字符类分隔符，保留空格作为词边界。
 # 若把空格也删掉，「富士 X-T4 18-55 套机」会黏成「富士XT41855套机」，
@@ -186,6 +200,28 @@ def _strip_accessories(normalized: str) -> str:
     return residue
 
 
+def _has_affirmative_fault(normalized: str) -> bool:
+    """只有**肯定陈述**的故障词才算故障。
+
+    逐个出现位置检查：被否定词覆盖、或处在顿号/逗号枚举中的，都跳过。
+    """
+    for hint in _FAULT_HINTS:
+        start = 0
+        while (index := normalized.find(hint, start)) != -1:
+            start = index + 1
+            window = normalized[max(0, index - _FAULT_NEGATION_WINDOW) : index]
+            if any(cue in window for cue in _FAULT_NEGATIONS):
+                continue
+            if index > 0 and normalized[index - 1] in _ENUMERATION_SEPARATORS:
+                continue
+            return True
+    return False
+
+
+def _accessory_in_headline(normalized: str) -> bool:
+    return any(hint in normalized[:_HEADLINE_WINDOW] for hint in _ACCESSORY_HINTS)
+
+
 def classify(
     title: str,
     *,
@@ -211,7 +247,7 @@ def classify(
         phrase in normalized for phrase in _WANTED_PHRASES
     ):
         flags.append(WANTED_TO_BUY)
-    if any(hint in normalized for hint in _FAULT_HINTS):
+    if _has_affirmative_fault(normalized):
         flags.append(REPAIR_OR_FAULT)
     if any(hint in normalized for hint in _DEPOSIT_HINTS):
         flags.append(DEPOSIT_OR_PLACEHOLDER)
@@ -224,32 +260,35 @@ def classify(
         else:
             flags.append(MODEL_MISMATCH)
 
-    accessory_hit = any(hint in normalized for hint in _ACCESSORY_HINTS)
+    accessory_hit = _accessory_in_headline(normalized)
     residue = _strip_accessories(normalized)
-    body_hit = any(hint in residue for hint in _BODY_HINTS)
+    body_strong = any(hint in residue for hint in _BODY_STRONG)
+    body_weak = any(hint in residue for hint in _BODY_WEAK)
     kit_hit = any(hint in residue for hint in _KIT_HINTS)
 
-    if accessory_hit and not body_hit and not kit_hit:
+    if accessory_hit and not (body_strong or body_weak) and not kit_hit:
         flags.append(ACCESSORY_ONLY)
 
     if kit_hit:
         flags.append(BUNDLE)
 
     kind: str | None
-    if body_hit and kit_hit:
+    if kit_hit and body_strong:
+        # 真冲突：「单机+套机都出」「单机身5499，套机6299」——
+        # 无法确定挂牌价对应哪个配置，不硬猜
         kind = None
-    elif body_hit:
-        kind = BODY
     elif kit_hit:
         kind = KIT
+    elif body_strong or body_weak:
+        kind = BODY
     else:
         kind = None
 
+    # 配置无法从文本确定即进 review。「成色如图」这类外观措辞在二手挂牌里几乎无处不在，
+    # 不单独作为升级 review 的理由，否则合格样本会被抽空。
     needs_review = False
     if kind is None and ACCESSORY_ONLY not in flags:
         flags.append(UNKNOWN_VARIANT)
-        needs_review = True
-    if any(hint in normalized for hint in _IMAGE_DEFERRAL_HINTS):
         needs_review = True
 
     excluded = any(flag in _HARD_EXCLUDES for flag in flags)

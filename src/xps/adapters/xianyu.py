@@ -181,13 +181,14 @@ class XianyuUpstreamAdapter:
         upstream_path: Path | str = DEFAULT_UPSTREAM_PATH,
         *,
         seconds_between_pages: float = 3.0,
-        source_commit: str | None = None,
     ) -> None:
         self._upstream_path = Path(upstream_path)
         self._seconds_between_pages = seconds_between_pages
         self._mtop: Any = None
         self._filters_cls: Any = None
-        self.source_commit = source_commit
+        # 上游 client 是模块级 httpx.AsyncClient，连接池绑定创建它的 loop。
+        # 因此按 loop 身份判断是否需要重新 init：同一个 loop 内只 init 一次。
+        self._init_loop: asyncio.AbstractEventLoop | None = None
 
     # -- 上游装载 ----------------------------------------------------------
 
@@ -215,14 +216,20 @@ class XianyuUpstreamAdapter:
 
     async def _ensure_init(self) -> None:
         self._load()
+        loop = asyncio.get_running_loop()
+        if self._init_loop is loop:
+            return
         try:
             await self._mtop.init()
         except Exception as exc:
+            # 带上真实原因：本地生命周期问题（如 Event loop is closed）
+            # 不该被笼统报成「平台取不到 token」
             raise UpstreamError(
                 "UPSTREAM_UNAVAILABLE",
-                f"上游初始化失败（取不到匿名 token）：{type(exc).__name__}",
+                f"上游初始化失败：{type(exc).__name__}: {exc}"[:300],
                 retryable=True,
             ) from exc
+        self._init_loop = loop
 
     # -- 契约实现 ----------------------------------------------------------
 

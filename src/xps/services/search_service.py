@@ -68,7 +68,7 @@ class SearchService:
             filters=request.filters_dict(),
             pages_requested=request.max_pages,
             adapter_version=ADAPTER_VERSION,
-            source_commit=self.settings.xianyu_source_commit,
+            source_commit=self.settings.resolved_source_commit(),
         )
         task = asyncio.create_task(self._execute(run_id, request), name=f"search-{run_id}")
         self._tasks.add(task)

@@ -129,7 +129,6 @@ def create_app(settings: Settings | None = None, *, adapter: object | None = Non
     app.state.adapter = adapter or XianyuUpstreamAdapter(
         app_settings.xianyu_upstream_path,
         seconds_between_pages=app_settings.seconds_between_pages,
-        source_commit=app_settings.xianyu_source_commit,
     )
 
     for module in _Routers:

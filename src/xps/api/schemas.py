@@ -22,7 +22,8 @@ class SearchSubmitRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     keyword: str = Field(min_length=1, max_length=KEYWORD_MAX_LENGTH)
-    max_pages: int = Field(1, ge=1, le=3)
+    # 上限由 MAX_SEARCH_PAGES 配置决定，在端点里校验；此处只挡明显非法值
+    max_pages: int = Field(1, ge=1)
     sort: SortOption = "newest"
     min_price_yuan: Decimal | None = Field(default=None, ge=0)
     max_price_yuan: Decimal | None = Field(default=None, ge=0)
@@ -92,6 +93,9 @@ class SearchRunResponse(BaseModel):
     ended_at: str | None
     warnings: list[str]
     error: RunError | None
+    # 采集来源可追溯：事后能判断这轮数据是哪个适配器/上游版本抓的
+    adapter_version: str | None = None
+    source_commit: str | None = None
 
 
 class ProductItem(BaseModel):
