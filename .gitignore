@@ -1,0 +1,25 @@
+# 第三方采集器：许可未确认，独立 checkout 评估，绝不 vendor 进本项目
+upstream/
+
+# 本地数据与备份
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# 登录态与凭据：任何情况下都不入库
+.env
+session.json
+qr_sessions.json
+login_trace.jsonl
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# 采集失败时上游可能落地的截图
+xianyu_error.png

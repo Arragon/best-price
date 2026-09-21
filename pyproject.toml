@@ -1,0 +1,35 @@
+[project]
+name = "xianyu-price-service"
+version = "0.1.0"
+description = "本地闲鱼商品搜索与在售报价统计服务（单平台 MVP，仅监听 127.0.0.1）"
+requires-python = ">=3.12"
+# 注意：上游 xianyu_spider 的依赖刻意不在此声明。
+# 其许可未确认（README 声称 MIT 但无 LICENSE 文件），故保留独立 checkout 边界，
+# 由 scripts/setup.sh 从 upstream/xianyu_spider/requirements.txt 装入同一 venv。
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "pydantic>=2.11",
+    "pydantic-settings>=2.4",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.28",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+# 真实闲鱼集成测试默认永不运行，必须显式 -m live 覆盖
+addopts = '-m "not live"'
+markers = [
+    "live: 真实访问闲鱼的集成测试；默认排除，需 `-m live` 显式触发，低频手动运行",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
