@@ -42,13 +42,20 @@ scripts/setup.sh
 # 2. 启动服务（默认 127.0.0.1:8765）
 scripts/start-local.sh
 
-# 3. 另开一个终端，跑一次真实低频烟测（会真的请求闲鱼）
-scripts/smoke-local.sh "富士 X-T4" 2 any
-#                      关键词      页数 配置(body|kit|any)
+# 3. 另开一个终端，一条命令拿结果（会真的请求闲鱼，请保持低频）
+scripts/query-price.sh "富士 X-T4" --kind body --pages 2
 
 # 离线测试（不打网络）
 .venv/bin/python -m pytest -q
 ```
+
+`scripts/query-price.sh` 是**给 agent 用的推荐入口**：它把 `POST → 轮询 → stats → products`
+四步、超时和错误分诊封成一条命令，输出里强制带上口径声明、样本量、排除原因、采集质量限制
+和可追溯链接 —— 调用方没法只报一个中位数就走。退出码：`0` 成功 / `2` 服务或参数问题 /
+`3` 采集失败 / `4` 轮询超时。
+
+想看原始 HTTP 交互或做更细的调试，用 `scripts/smoke-local.sh "富士 X-T4" 2 any`
+（`RUN_ID=<已完成的run> scripts/smoke-local.sh …` 可复用已有 run，不重复打平台）。
 
 交互式 API 文档：启动后访问 <http://127.0.0.1:8765/docs>，或 `GET /openapi.json`。
 
@@ -74,11 +81,38 @@ scripts/login.sh --cookie     # 粘贴浏览器 Cookie（在本机终端里输�
 scripts/login.sh --browser    # 直接打开官方登录页
 ```
 
-安全约束：
+### 凭证记忆：一次登录，长期有效
+
+登录成功后上游会把 `{cookies, device_id, user, user_id}` 写入
+`upstream/xianyu_spider/data/session.json`（由 `mtop.persist_login()` 落盘）。
+本服务每次 `init()` 都会 `load_session()` 把它读回内存，所以**扫一次码，之后重启服务都自动带登录态**。
+
+服务运行期间在另一个终端登录了？不用重启：
+
+```bash
+curl -sS -X POST http://127.0.0.1:8765/v1/auth/reload
+```
+
+它会重跑 `init()` 重新读取 `session.json`。（上游的 `login_snapshot()` 读的是内存 cookie jar，
+不会自己感知磁盘变化，所以需要这个显式动作。）
+
+### 不主动过期
+
+本服务**不会**主动去平台校验登录态，也**不会**主动作废你的凭证。原因是上游
+`probe_login()` 的行为：它在 `fetch_login_user()` 抛**任何**异常时都会走
+`invalidate_expired_login()`，而后者 `client.cookies.clear()` 并 `clear_session()` ——
+**直接删除 `session.json`**。也就是一次网络抖动就能毁掉你扫码换来的登录态，逼人重新扫脸。
+
+取而代之：`/v1/auth/status` 只读纯内存快照，并返回 `verified: false` 如实表明未向平台校验。
+凭证真的失效时，会在**搜索时**由平台返回的 `ret` 码被动反映为 `AUTH_EXPIRED`
+（`requires_human_action: true`），那时再 `scripts/login.sh` 重新登录即可。
+这是有证据的判定，不会因为一次抖动就误删凭证。
+
+### 安全约束
 
 - 不要把 Cookie、密码、短信验证码发给任何人，也不要粘贴进聊天。本服务不读取、不打印、不上传任何凭据。
-- 登录态落在 `upstream/xianyu_spider/data/session.json`，脚本会自动 `chmod 600`，且已被 `.gitignore` 排除。
-- `/v1/auth/status` 只回传状态枚举（`logged_in|guest|expired|unknown|human_action_required`），**绝不回传 Cookie 或 user_id 原值**。
+- `session.json` 由 `scripts/login.sh` 自动 `chmod 600`，且被 `.gitignore` 双重排除（`upstream/` 整体 + `session.json`）。
+- `/v1/auth/status` 只回传状态枚举，**绝不回传 Cookie 或 user_id 原值**。
 - 首次扫脸核身需要 Chromium：`.venv/bin/python -m playwright install chromium`
 
 ---
@@ -86,6 +120,11 @@ scripts/login.sh --browser    # 直接打开官方登录页
 ## API
 
 ### Agent 调用流程
+
+**推荐**：直接用 `scripts/query-price.sh`（见「快速开始」），它已经实现了下面整套流程，
+并把必须转述的口径与限制固化进输出。
+
+需要自己编排时的原始流程：
 
 ```text
 POST /v1/search  →  202 + run_id
@@ -202,16 +241,22 @@ curl -sS "http://127.0.0.1:8765/v1/stats?run_id=<RUN>&item_kind=body"
 `excluded_by_reason` 各项之和可能大于 `excluded_count`：一个商品可同时命中多个排除原因
 （例如租赁盘的样板文案里同时出现「押金」），按原因分别计数，商品本身只算一次。
 
-### `GET /health` 与 `GET /v1/auth/status`
+### `GET /health`、`GET /v1/auth/status`、`POST /v1/auth/reload`
 
 ```bash
 curl -sS http://127.0.0.1:8765/health
 # {"status":"ok","database":"ok","version":"0.1.0","adapter":"XianyuUpstreamAdapter"}
+
 curl -sS http://127.0.0.1:8765/v1/auth/status
-# {"state":"guest","requires_human_action":false,"hint":null}
+# {"state":"guest","requires_human_action":false,"verified":false,
+#  "hint":"未登录（guest 可搜索）；如需登录态请在本机运行 scripts/login.sh 后调用 POST /v1/auth/reload"}
+
+curl -sS -X POST http://127.0.0.1:8765/v1/auth/reload   # 登录后免重启
 ```
 
-`/health` 只看进程与本地 SQLite；**登录态丢失不算进程不健康**。
+- `/health` 只看进程与本地 SQLite；**登录态丢失不算进程不健康**。
+- `verified: false` 表示未向平台主动校验 —— 这是刻意的，见上文「不主动过期」。
+- `/v1/auth/reload` 只接受 POST（GET 返回 405），避免被预取式请求意外触发；它不修改也不删除任何凭证文件。
 
 ---
 
@@ -334,7 +379,7 @@ run_items     视图 = SELECT run_id, product_id FROM observations
 | `INVALID_QUERY` | 422/404 | ✗ | ✗ | 检查参数；404 表示 run_id 不存在 |
 | `UNSUPPORTED_FILTER` | 422 | ✗ | ✗ | 该筛选未经验证，去掉它 |
 | `AUTH_REQUIRED` | 401 | ✗ | ✓ | 运行 `scripts/login.sh` |
-| `AUTH_EXPIRED` | 401 | ✗ | ✓ | 重新登录；guest 搜索仍可继续 |
+| `AUTH_EXPIRED` | 401 | ✗ | ✓ | 运行 `scripts/login.sh` 重新登录，再 `POST /v1/auth/reload`（免重启）；guest 搜索仍可继续 |
 | `CHALLENGE_REQUIRED` | 409 | ✗ | ✓ | **停止自动操作**，到闲鱼 App 完成验证 |
 | `RATE_LIMITED` | 429 | ✓ | ✓ | 停止重试，调大 `MIN_SECONDS_BETWEEN_SEARCHES` |
 | `UPSTREAM_CHANGED` | 502 | ✗ | ✓ | 平台/上游结构漂移，重跑 `scripts/verify_upstream.py` |
@@ -349,6 +394,19 @@ run_items     视图 = SELECT run_id, product_id FROM observations
 
 `partial` 状态表示部分页成功：`/v1/stats` 会同时返回 `partial=true` 与
 `sample_quality` 里的 `partial_pages:已抓/请求`。
+
+### 连本机却拿到 502？（macOS 系统代理）
+
+`scripts/query-price.sh` 已内置 `trust_env=False`，不会踩这个坑。但如果你自己写 Python 客户端：
+
+httpx 默认 `trust_env=True`，会调 `urllib.request.getproxies()`。在 macOS 上该函数读**系统代理**
+且**不应用** ExceptionsList（bypass 列表），所以即使系统设置里已把 `127.0.0.1` 排除，
+httpx 仍会把本机请求塞给代理（实测 `127.0.0.1:7890`），拿回 **502**，看起来像服务挂了。
+`curl` 会自己应用 bypass，所以 curl 通、httpx 不通。
+
+```python
+httpx.Client(base_url="http://127.0.0.1:8765", trust_env=False)   # 只连本机，忽略代理
+```
 
 ---
 
@@ -382,10 +440,10 @@ run_items     视图 = SELECT run_id, product_id FROM observations
 环境    macOS 26.6.2 (Darwin arm64) / CPython 3.12.13 / pytest 9.1.1 / fastapi 0.141.1
 
 命令    .venv/bin/python -m pytest -q
-结果    287 passed, 4 deselected          （离线，未访问网络；耗时 4–7s 随机器负载浮动）
+结果    326 passed, 4 deselected          （离线，未访问网络；耗时 2–8s 随机器负载浮动）
 
 命令    .venv/bin/python -m pytest -m live -q
-结果    4 passed, 287 deselected in 23.23s （真实闲鱼，guest，6 次搜索页请求）
+结果    4 passed, 326 deselected in 21.81s （真实闲鱼，guest，6 次搜索页请求）
 ```
 
 ---
@@ -423,9 +481,10 @@ src/xps/
 ├── main.py               FastAPI 装配、生命周期、统一错误处理
 ├── settings.py           环境变量与配置校验（含 loopback 强制）
 ├── errors.py             错误码全集与 HTTP/retryable/需人工映射
+├── cli.py                一键查询客户端；render_report/render_failure 固化转述纪律
 ├── adapters/
 │   ├── base.py           RawListing / CrawlResult / PageOutcome / XianyuAdapter 契约
-│   └── xianyu.py         进程内包装上游 mtop；逐页串行 + 节流 + ret 码映射
+│   └── xianyu.py         进程内包装上游 mtop；逐页串行 + 节流 + ret 码映射；登录态不主动过期
 ├── api/
 │   ├── schemas.py        外部 API 数据类型
 │   ├── deps.py           共享依赖（含「失败 run 不得退化成 200+[]」）
@@ -440,7 +499,8 @@ src/xps/
     ├── db.py             连接/WAL/幂等迁移/VACUUM INTO 备份
     ├── schema.sql
     └── repository.py
-scripts/   setup.sh start-local.sh login.sh smoke-local.sh backup-sqlite.sh verify_upstream.py
+scripts/   setup.sh start-local.sh login.sh query-price.sh smoke-local.sh
+           backup-sqlite.sh verify_upstream.py
 tests/     离线单测与 API 契约 + fake_adapter.py + fixtures/ + test_smoke_live.py(-m live)
 data/      gitignored：price.sqlite3、backups/、probe/、upstream-commit.txt
 upstream/  gitignored：上游独立 checkout，许可未确认

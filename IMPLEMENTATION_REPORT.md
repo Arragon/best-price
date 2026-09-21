@@ -61,6 +61,36 @@ Playwright + Web UI + AI 分析的重型监控系统，面向持续监控而非�
 - `scripts/login.sh` 已提供，供用户本人在需要登录态数据时自行扫码；脚本会自动 `chmod 600 session.json`。
 - 当前**无 `session.json`**（用户未登录）。
 
+### 凭证记忆与「不主动过期」（按用户要求实现）
+
+代码路径已逐行核实：
+
+- `persist_login()`（`mtop.py:234`）把 `{cookies, device_id, user, user_id}` 写入
+  `SESSION_PATH` = `upstream/xianyu_spider/data/session.json`（由 `config.py` 的 `ROOT_DIR` 推导）
+- `mtop.init()`（`mtop.py:132`）调 `load_session()`，若有 cookies 即 `apply_cookies()` 并恢复
+  `_device_id` / `_user_info` → **扫一次码，之后每次进程启动自动带登录态**
+
+**发现的上游危险行为**：`probe_login()`（`mtop.py:407`）在 `fetch_login_user()` 抛**任何**异常时
+都会走 `invalidate_expired_login()`（`mtop.py:382`），后者执行 `client.cookies.clear()` 并
+`clear_session()` —— **直接删除 `session.json`**。也就是一次网络抖动就能永久毁掉用户扫码换来的登录态。
+
+**处置**：`auth_status()` 改为只调 `login_snapshot()`（已核实为纯内存函数：无 `await`、无 `client` 调用），
+**绝不调用 `probe_login()`**。语义变为「一次登录后，凭证在本进程生命周期内持续有效，不主动过期」。
+真实失效改由搜索时平台返回的 `ret` 码被动反映（`FAIL_SYS_SESSION_EXPIRED` → `AUTH_EXPIRED`）。
+`/v1/auth/status` 增加 `verified: false` 字段，如实表明未向平台校验，不让调用方误以为已确认有效。
+
+配套新增 `POST /v1/auth/reload`：重跑 `init()` 重新读取 `session.json`，用户在另一终端登录后
+**无需重启服务**。（上游 `login_snapshot()` 读内存 cookie jar，不会自己感知磁盘变化。）
+该端点只接受 POST，GET 返回 405。
+
+顺带修正一处错误码语义：`FAIL_SYS_SESSION_EXPIRED` 原被映射为 `AUTH_REQUIRED`（需登录），
+实际含义是「曾登录、凭证已失效」，改为 `AUTH_EXPIRED` 并纳入 `HALT_CODES`
+（凭证已死时继续翻页无意义）。两者给用户的行动指引不同。
+
+测试覆盖（`tests/test_adapter_lifecycle.py`）：`probe_login` 调用次数恒为 0；
+构造一个「探测即销毁凭证」的桩，断言 `session_file_exists` 仍为 True；
+`reload()` 能在不重启的情况下拾取新登录态且确实重跑了 `init()`。
+
 ## 一页真实搜索：**pass**
 
 | 项 | 值 |
@@ -108,7 +138,7 @@ Playwright + Web UI + AI 分析的重型监控系统，面向持续监控而非�
 
 ```
 $ .venv/bin/python -m pytest -q
-287 passed, 4 deselected in 6.41s          # 离线，未访问网络
+326 passed, 4 deselected          # 离线，未访问网络
 ```
 
 覆盖（对应指南 §Phase2 验收与 §11 矩阵）：
@@ -137,8 +167,9 @@ $ .venv/bin/python -m pytest -q
 | GET | `/v1/products` | `run_id` 必填；`eligible_only` / `limit`(默认50,上限100) / `offset`；返回 `total` |
 | GET | `/v1/stats` | `run_id` 必填 + `item_kind`；分位数、排除原因分组、`lowest_items`、`sample_quality` |
 | GET | `/health` | 进程 + SQLite；登录态丢失**不算**不健康 |
-| GET | `/v1/auth/status` | 状态枚举；绝不回传 Cookie / user_id |
-| GET | `/openapi.json`、`/docs` | OpenAPI 文档 |
+| GET | `/v1/auth/status` | 本地登录态快照 + `verified` 标志；绝不回传 Cookie / user_id |
+| POST | `/v1/auth/reload` | 重跑 `init()` 重读 `session.json`；登录后免重启。GET → 405 |
+| GET | `/openapi.json`、`/docs` | OpenAPI 文档（实测 `/docs` → HTTP 200，openapi 3.1.0，6 条路径） |
 
 验收（§Phase3）：
 
@@ -154,6 +185,53 @@ $ .venv/bin/python -m pytest -q
 
 **真实端到端验证**：`scripts/smoke-local.sh "富士 X-T4" 2 any` 于 2026-09-22 跑通完整链路
 （health → auth/status → POST → poll → products → stats），输出见 README「统计方法」一节的真实响应。
+
+## Agent 客户端：**pass**
+
+新增 `src/xps/cli.py` + `scripts/query-price.sh`：一条命令完成 `POST → poll → stats → products`。
+
+```
+$ .venv/bin/python -m pytest -q tests/test_cli.py
+29 passed
+```
+
+设计重点是**把转述纪律固化成代码**，而不是靠提示词约束 agent：
+
+- `render_report()` 无条件输出口径声明（「采集时刻的公开在售报价，不是成交价，不含国补/优惠券/议价」）、
+  样本量、`excluded_by_reason` 分组、`needs_review_count`、`sample_quality` 全量、可追溯链接、
+  `run_id` / `source_commit` / 采集时间
+- `insufficient_sample` 为真时打印醒目告警，且**测试断言输出里不得出现「公允价」**（§7：不产生过度确定的结论）
+- 合格样本为 0 时不打印中位数，改为指向 `excluded_by_reason`，并明确「这是筛选结果，不代表平台查不到商品」
+- `render_failure()` 按错误码给出具体下一步（`CHALLENGE_REQUIRED` → 到闲鱼 App 完成验证；
+  `AUTH_EXPIRED` → `scripts/login.sh` 后 `POST /v1/auth/reload`），并**测试断言输出里不得出现
+  「没有商品」「无结果」**（§0.6：失败不得伪装成空结果）
+- 退出码：`0` 成功 / `2` 服务或参数问题 / `3` 采集失败 / `4` 轮询超时；失败与超时路径均有测试
+
+### 顺带修掉一个会让 CLI 在 macOS 上直接不可用的坑
+
+现象：`curl http://127.0.0.1:8765/health` 正常，但 CLI 用 httpx 请求同一地址拿到 **HTTP 502**。
+
+根因（已实测确认，非推测）：
+
+```
+$ python -c "import urllib.request; print(urllib.request.getproxies())"
+{'http': 'http://127.0.0.1:7890', 'https': 'http://127.0.0.1:7890', 'socks': 'http://127.0.0.1:7890'}
+
+$ scutil --proxy
+  ExceptionsList : [127.0.0.1, 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12, localhost, *.local, …]
+  HTTPProxy : 127.0.0.1   HTTPPort : 7890
+```
+
+macOS 系统代理的 `ExceptionsList` **明确包含 `127.0.0.1`**，但 `urllib.request.getproxies()`
+返回代理时**不应用这个 bypass 列表**；httpx 默认 `trust_env=True` 用的正是它，于是把本机请求
+也塞给了 `127.0.0.1:7890`，代理回 502。curl 自己会应用 bypass，所以 curl 通、httpx 不通 ——
+极易被误判成「服务挂了」。
+
+处置：`build_client()` 固定 `trust_env=False`（本 CLI 只连本机，没有任何走代理的理由）。
+测试同时断言「httpx 默认客户端**确实**挂载了代理」作为前提护栏，避免该测试在 httpx 行为变化后变成假阳性。
+
+**影响面提示**：任何开着系统代理的 macOS 上，未设 `trust_env=False` 的 Python 客户端都会踩到。
+README「故障处理」已加入该条排查说明。
 
 ## 统计：**pass**
 
@@ -242,21 +320,34 @@ $ .venv/bin/python -m pytest -q tests/test_stats.py tests/test_classify.py
    （`scripts/smoke-local.sh`，run `b1ad3465-6af3-4390-afd2-cff01fd09455`，`status=succeeded`，60 条入库）
 6. 真实数据上的分类与统计：eligible 14(any)/12(body)/2(kit)，套机中位数高于单机身
 7. 真实数据暴露并修复三类误判（见上表），修复后离线复核 + 重新真实采集双验证
-8. `pytest -m live`：**4 passed, 287 deselected in 23.23s**（真实闲鱼，约 6 次搜索页请求）
+8. `pytest -m live`：**4 passed, 326 deselected in 21.81s**（真实闲鱼，6 次搜索页请求）。
+   改动登录态实现后**重跑过一次**，不是沿用旧结果
 9. 备份脚本对真实数据库执行：`integrity_check=ok`，行数 `search_runs=1, products=60, observations=60`
+10. `scripts/query-price.sh "富士 X-T4" --kind body --pages 1` 真实跑通，退出码 0：
+    run `864e02c6-5891-4d98-9eb2-f8604c7534f7`，30 条原始 → 合格 4 件、排除 20、待核验 6，
+    正确触发 `insufficient_sample` + `single_page_only` + `guest_auth` 三项质量限制，
+    并输出 4 条可点开的商品链接
+11. 本轮 `accessory_only` 命中 3 条，人工逐条核对**全部为真配件**（¥65 绿联 NP-W235 副厂电池、
+    ¥70 沣标 NP-W235 副厂电池、¥460 铭匠 AF 35mm F1.8 镜头）；其中镜头那条标题含
+    「无拆修」「无霉」却**未**被误判为故障机 —— 否定语境守卫在新的真实数据上再次生效
+12. `POST /v1/auth/reload` 与 `GET /v1/auth/status` 对运行中的真实服务调用成功，
+    返回 `verified: false`；`GET /v1/auth/reload` 正确返回 405
 
-真实请求总量：**14 次搜索页请求**（另有每个进程/事件循环初始化时的 2 次 token 请求），
-分布在 6 次独立运行中，页间隔 ≥ 3 秒、轮次间隔 ≥ 12 秒。**全程未触发验证码、风控或拒绝。**
+真实请求总量：**21 次搜索页请求**（另有每个进程/事件循环初始化时的 2 次 token 请求），
+分布在 9 次独立运行中，页间隔 ≥ 3 秒、轮次间隔 ≥ 12 秒。**全程未触发验证码、风控或拒绝。**
 
 明细：`verify_upstream.py` 1 页 + 2 页 + 1 页重抓 = 4；`smoke-local.sh` 两轮各 2 页 = 4；
-`pytest -m live` = 6。
+`pytest -m live` 两次各 6 = 12；`query-price.sh` 1 页 = 1。
 
 ## 仅离线 fixture 验证范围（`NOT_VERIFIED_LIVE`）
 
 | 项 | 状态 | 说明 |
 |---|---|---|
 | 验证码 / 滑块 / 风控分支 | **NOT_VERIFIED_LIVE** | 错误码映射与「立即停止翻页」逻辑已实现并有单测（用桩），但**未主动触发真实风控去验证** —— 指南 §5.3 明确「不能主动制造大量风控请求」 |
-| 登录态（`logged_in`）下的搜索差异 | **NOT_VERIFIED_LIVE** | 本轮全部为 guest。登录后结果集是否更大、可见字段是否更多、`login_expired` 降级路径在真实环境的表现，均未验证 |
+| 登录态（`logged_in`）下的搜索差异 | **NOT_VERIFIED_LIVE** | 本轮全部为 guest。登录后结果集是否更大、可见字段是否更多，均未验证 |
+| `login_expired` 降级路径 / `AUTH_EXPIRED` 真实触发 | **NOT_VERIFIED_LIVE** | `ret` 码 → 错误码的映射由桩测试覆盖，但**没有真实失效凭证**可用于触发。且新设计刻意不主动探测，因此该路径只会在真实搜索被平台拒绝时才走到 |
+| `POST /v1/auth/reload` 在**已登录**状态下的效果 | **NOT_VERIFIED_LIVE** | 已在 guest 态对真实服务调用成功（返回 `verified:false`，`init_calls` 递增由桩测试验证）。但「登录后 reload 能否正确切到 `logged_in`」需要真实 `session.json`，当前没有 |
+| `login_snapshot()` 与真实 `session.json` 的字段契合度 | **NOT_VERIFIED_LIVE** | 桩忠实模拟了 `init()` 从磁盘加载语义，但未用真实凭证验证过 |
 | `city` / `province` / `publish_days` 筛选是否真被平台执行 | **NOT_VERIFIED_LIVE** | 上游 `SearchFilters` 确实构造了对应 mtop 参数，但**未实测平台是否真过滤**。故 API 一律返回 `422 UNSUPPORTED_FILTER`，不暗称已过滤 |
 | `sort=price_asc` / `price_desc` / `default` 的真实排序效果 | **NOT_VERIFIED_LIVE** | 仅验证 `newest`。枚举值对齐上游实测 `SORT_OPTIONS`，但其余三种的排序结果未抽样核对 |
 | 扫脸核身 / Playwright 路径 | **NOT_VERIFIED_LIVE** | 未安装 Chromium（搜索路径不需要）。已确认 Playwright 仅在 `qr_browser.py:156` 函数内惰性导入 |
@@ -269,7 +360,7 @@ $ .venv/bin/python -m pytest -q tests/test_stats.py tests/test_classify.py
 | # | 阻塞项 | 类型 | 用户需做的最小操作 |
 |---|---|---|---|
 | 1 | **浏览器人工交叉核对**（Gate A 第 3 项的唯一未闭合部分） | 需人工 | 在浏览器打开 <https://www.goofish.com/item?id=1083967235157>（¥5499 单机）与 <https://www.goofish.com/item?id=1086862848607>（¥4390 单机身），确认标题与价格和本服务返回一致。这是 Agent 无法替代的步骤 |
-| 2 | 登录态数据未验证 | 需人工（可选） | 如需验证登录后的结果差异：本机终端运行 `scripts/login.sh` 自行扫码，完成后告知，我再跑一轮对比。**不要把 Cookie 发给我** |
+| 2 | 登录态数据未验证 | 需人工（可选） | 本机终端运行 `scripts/login.sh` 自行扫码 → `curl -X POST localhost:8765/v1/auth/reload`（免重启）→ 确认 `/v1/auth/status` 变为 `logged_in`，然后告知我跑一轮 guest vs logged_in 对比。**不要把 Cookie 发给我** |
 | 3 | 上游许可未确认 | 需法律判断 | 若要分发或商用，须先向作者取得明确授权，或改用 MIT 的 `ai-goofish-monitor`（需评估改造成本）。当前仅限本机个人使用 |
 | 4 | 筛选/排序能力未验证 | 可选 | 如需开放 `city`/`publish_days`/其他 sort，需先各跑一次低频真实搜索并与浏览器结果交叉核对，确认后我再放开对应的 `UNSUPPORTED_FILTER` |
 
@@ -283,10 +374,12 @@ $ .venv/bin/python -m pytest -q tests/test_stats.py tests/test_classify.py
 ```bash
 scripts/setup.sh                                  # 一次性初始化（幂等）
 scripts/start-local.sh                            # 启动服务 127.0.0.1:8765
-scripts/smoke-local.sh "富士 X-T4" 2 any           # 真实低频烟测
+scripts/query-price.sh "富士 X-T4" --kind body --pages 2   # ★ agent 推荐入口，一条命令出结果
+scripts/smoke-local.sh "富士 X-T4" 2 any           # 原始 HTTP 烟测（调试用）
 RUN_ID=<已完成的run> scripts/smoke-local.sh ...    # 复用已有 run，不重复打平台
 scripts/backup-sqlite.sh                          # 在线备份 + 校验
 scripts/login.sh                                  # 可选：人工登录
+curl -sS -X POST localhost:8765/v1/auth/reload    # 登录后免重启拾取凭证
 
 .venv/bin/python -m pytest -q                     # 离线测试（默认，不打网络）
 .venv/bin/python -m pytest -m live -q             # 真实集成（手动、低频）
@@ -302,14 +395,16 @@ IMPLEMENTATION_REPORT.md                         本报告
 .gitignore
 pyproject.toml                                   自有依赖 + pytest 配置（live 默认排除）
 docs/superpowers/specs/2026-09-22-xianyu-price-service-design.md    设计决策与 Gate A 证据
-scripts/setup.sh  start-local.sh  login.sh  smoke-local.sh  backup-sqlite.sh  verify_upstream.py
-src/xps/__init__.py  main.py  settings.py  errors.py
+scripts/setup.sh  start-local.sh  login.sh  query-price.sh  smoke-local.sh
+scripts/backup-sqlite.sh  verify_upstream.py
+src/xps/__init__.py  main.py  settings.py  errors.py  cli.py
 src/xps/adapters/base.py  xianyu.py
 src/xps/api/schemas.py  deps.py  search.py  products.py  stats.py  system.py
 src/xps/services/normalize.py  identity.py  classify.py  statistics.py  search_service.py
 src/xps/storage/db.py  schema.sql  repository.py
 tests/test_price_normalize.py  test_identity.py  test_classify.py  test_stats.py
-tests/test_normalize.py  test_repository.py  test_api_contract.py  test_adapter_lifecycle.py
+tests/test_normalize.py  test_repository.py  test_api_contract.py
+tests/test_adapter_lifecycle.py  test_cli.py
 tests/test_smoke_live.py                         -m live，默认排除
 tests/fake_adapter.py  tests/fixtures/mtop_entry.py     均标注 SYNTHETIC
 ```
@@ -321,11 +416,15 @@ tests/fake_adapter.py  tests/fixtures/mtop_entry.py     均标注 SYNTHETIC
 ### Git 提交
 
 ```
+32a581c feat: 登录态改为进程内长期有效，并新增 agent 一键查询客户端
+03f339a docs: README、实施报告与运维脚本
 422ff88 fix: 用真实数据修正分类误删，并让上游 init 按事件循环幂等
 29ea316 feat: 本地 API、任务生命周期与统计接口（Phase 3/4）
 a731f5d feat: 标准化、身份、分类、统计与 SQLite 存储层（Phase 2/4）
 f4e217f docs: 记录 Gate A 实测证据与设计决策，钉死上游 commit
 ```
+
+（本节与 README 的这轮更新在其后单独提交，故未列出自身哈希。）
 
 ---
 
