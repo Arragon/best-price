@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
+from xps.services.identity import INVALID_IDENTITY as INVALID_ID_SOURCE
 from xps.services.normalize import NormalizedListing
 from xps.services.statistics import StatsItem
 
@@ -65,7 +66,7 @@ class RunRecord:
     pages_fetched: int
     raw_count: int
     stored_count: int
-    eligible_count: int
+    priced_count: int
     error_code: str | None
     error_message: str | None
     warnings: tuple[str, ...]
@@ -88,6 +89,11 @@ class ProductRecord:
 
 @dataclass(frozen=True)
 class ObservationRecord:
+    """一行 observation = 平台当时展示的一件商品的清洗后快照。
+
+    全部字段都是平台真实给出的值，缺失即 None；本服务不附加任何相关性判断。
+    """
+
     observation_id: int
     product_id: int
     run_id: str
@@ -95,20 +101,30 @@ class ObservationRecord:
     page_number: int | None
     title: str | None
     title_raw: str | None
+    description: str | None
     price_raw: str | None
     price_fen: int | None
     currency: str | None
     price_parse_status: str
+    original_price_text: str | None
+    coupon_text: str | None
     area: str | None
     seller_display_name: str | None
+    seller_credit: str | None
+    seller_review_count: int | None
+    seller_positive_rate: str | None
+    seller_identity: str | None
+    seller_avatar_url: str | None
     image_url: str | None
+    has_video: bool
     published_at: str | None
+    published_text: str | None
+    want_count: int | None
+    free_shipping: bool
+    labels: tuple[str, ...]
+    is_auction: bool
+    is_ad: bool
     canonical_url: str | None
-    flags: tuple[str, ...]
-    item_kind: str | None
-    excluded: bool
-    exclusion_reasons: tuple[str, ...]
-    needs_review: bool
 
 
 @dataclass(frozen=True)
@@ -116,6 +132,10 @@ class StoreSummary:
     stored: int = 0
     deduped: int = 0
     skipped_unidentifiable: int = 0
+    # 有 URL 可去重、但主机不在实测确认的白名单里 → canonical_url 为 None。
+    # 仍然入库（它是平台真实返回的条目），但要在 run warnings 里露出来，
+    # 否则调用方会以为每条都有可点开的追溯链接。
+    untrusted_identity: int = 0
 
 
 def _run_record(row: sqlite3.Row) -> RunRecord:
@@ -132,7 +152,7 @@ def _run_record(row: sqlite3.Row) -> RunRecord:
         pages_fetched=row["pages_fetched"],
         raw_count=row["raw_count"],
         stored_count=row["stored_count"],
-        eligible_count=row["eligible_count"],
+        priced_count=row["priced_count"],
         error_code=row["error_code"],
         error_message=row["error_message"],
         warnings=_loads_tuple(row["warnings_json"]),
@@ -163,20 +183,30 @@ _OBSERVATION_SELECT = """
            o.page_number   AS page_number,
            COALESCE(o.title_raw, p.title_latest) AS title,
            o.title_raw     AS title_raw,
+           o.description   AS description,
            o.price_raw     AS price_raw,
            o.price_fen     AS price_fen,
            o.currency      AS currency,
            o.price_parse_status AS price_parse_status,
+           o.original_price_text AS original_price_text,
+           o.coupon_text   AS coupon_text,
            o.area          AS area,
            o.seller_display_name AS seller_display_name,
+           o.seller_credit AS seller_credit,
+           o.seller_review_count AS seller_review_count,
+           o.seller_positive_rate AS seller_positive_rate,
+           o.seller_identity AS seller_identity,
+           o.seller_avatar_url AS seller_avatar_url,
            o.image_url     AS image_url,
+           o.has_video     AS has_video,
            o.published_at  AS published_at,
-           p.canonical_url AS canonical_url,
-           o.flags_json    AS flags_json,
-           o.item_kind     AS item_kind,
-           o.excluded      AS excluded,
-           o.exclusion_reasons_json AS exclusion_reasons_json,
-           o.needs_review  AS needs_review
+           o.published_text AS published_text,
+           o.want_count    AS want_count,
+           o.free_shipping AS free_shipping,
+           o.labels_json   AS labels_json,
+           o.is_auction    AS is_auction,
+           o.is_ad         AS is_ad,
+           p.canonical_url AS canonical_url
       FROM observations o
       JOIN products p ON p.id = o.product_id
 """
@@ -191,20 +221,30 @@ def _observation_record(row: sqlite3.Row) -> ObservationRecord:
         page_number=row["page_number"],
         title=row["title"],
         title_raw=row["title_raw"],
+        description=row["description"],
         price_raw=row["price_raw"],
         price_fen=row["price_fen"],
         currency=row["currency"],
         price_parse_status=row["price_parse_status"],
+        original_price_text=row["original_price_text"],
+        coupon_text=row["coupon_text"],
         area=row["area"],
         seller_display_name=row["seller_display_name"],
+        seller_credit=row["seller_credit"],
+        seller_review_count=row["seller_review_count"],
+        seller_positive_rate=row["seller_positive_rate"],
+        seller_identity=row["seller_identity"],
+        seller_avatar_url=row["seller_avatar_url"],
         image_url=row["image_url"],
+        has_video=bool(row["has_video"]),
         published_at=row["published_at"],
+        published_text=row["published_text"],
+        want_count=row["want_count"],
+        free_shipping=bool(row["free_shipping"]),
+        labels=_loads_tuple(row["labels_json"]),
+        is_auction=bool(row["is_auction"]),
+        is_ad=bool(row["is_ad"]),
         canonical_url=row["canonical_url"],
-        flags=_loads_tuple(row["flags_json"]),
-        item_kind=row["item_kind"],
-        excluded=bool(row["excluded"]),
-        exclusion_reasons=_loads_tuple(row["exclusion_reasons_json"]),
-        needs_review=bool(row["needs_review"]),
     )
 
 
@@ -258,7 +298,7 @@ class Repository:
         pages_fetched: int = 0,
         raw_count: int = 0,
         stored_count: int = 0,
-        eligible_count: int = 0,
+        priced_count: int = 0,
         auth_mode: str | None = None,
         error_code: str | None = None,
         error_message: str | None = None,
@@ -269,7 +309,7 @@ class Repository:
             self.conn.execute(
                 """UPDATE search_runs
                       SET status=?, ended_at=?, auth_mode=?, pages_fetched=?,
-                          raw_count=?, stored_count=?, eligible_count=?,
+                          raw_count=?, stored_count=?, priced_count=?,
                           error_code=?, error_message=?, warnings_json=?
                     WHERE id=?""",
                 (
@@ -279,7 +319,7 @@ class Repository:
                     pages_fetched,
                     raw_count,
                     stored_count,
-                    eligible_count,
+                    priced_count,
                     error_code,
                     error_message,
                     json.dumps(list(warnings), ensure_ascii=False),
@@ -323,7 +363,7 @@ class Repository:
                     identity.id_source,
                     identity.identity_key,
                     identity.canonical_url,
-                    entry.title,
+                    entry.raw.title,
                     observed_at,
                     observed_at,
                 ),
@@ -342,7 +382,7 @@ class Repository:
                     WHERE id=?""",
                 (
                     observed_at,
-                    entry.title,
+                    entry.raw.title,
                     identity.canonical_url,
                     identity.platform_item_id,
                     product_id,
@@ -357,12 +397,14 @@ class Repository:
         *,
         page_number: int | None = None,
     ) -> StoreSummary:
-        stored = deduped = skipped = 0
+        stored = deduped = skipped = untrusted = 0
         with self.conn:
             for entry in listings:
                 if not entry.storable:
                     skipped += 1
                     continue
+                if entry.identity.id_source == INVALID_ID_SOURCE:
+                    untrusted += 1
 
                 observed_at = _iso(entry.observed_at)
                 product_id = self._upsert_product(entry, observed_at)
@@ -376,36 +418,50 @@ class Repository:
                     deduped += 1
                     continue
 
-                classification = entry.classification
+                raw = entry.raw
+                price = entry.price
                 cursor = self.conn.execute(
                     """INSERT INTO observations
-                           (product_id, run_id, observed_at, page_number, title_raw, price_raw,
-                            price_fen, currency, price_parse_status, area, seller_display_name,
-                            image_url, published_at, raw_payload_json, flags_json, item_kind,
-                            excluded, exclusion_reasons_json, needs_review)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           (product_id, run_id, observed_at, page_number, title_raw, description,
+                            price_raw, price_fen, currency, price_parse_status,
+                            original_price_text, coupon_text,
+                            area, seller_display_name, seller_credit, seller_review_count,
+                            seller_positive_rate, seller_identity, seller_avatar_url,
+                            image_url, has_video, published_at, published_text, want_count,
+                            free_shipping, labels_json, is_auction, is_ad, raw_payload_json)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         product_id,
                         run_id,
                         observed_at,
                         page_number,
-                        entry.title,
-                        entry.price_raw,
-                        entry.price_fen,
-                        entry.currency,
-                        entry.price_status,
-                        entry.area,
-                        entry.seller_display_name,
-                        entry.image_url,
-                        entry.published_at,
-                        json.dumps(entry.raw_payload, ensure_ascii=False)
-                        if entry.raw_payload is not None
+                        raw.title,
+                        raw.description,
+                        price.price_raw,
+                        price.price_fen,
+                        price.currency,
+                        price.status,
+                        raw.original_price_text,
+                        raw.coupon_text,
+                        raw.area,
+                        raw.seller_name,
+                        raw.seller_credit,
+                        raw.seller_review_count,
+                        raw.seller_positive_rate,
+                        raw.seller_identity,
+                        raw.seller_avatar_url,
+                        raw.image_url,
+                        int(raw.has_video),
+                        raw.published_at,
+                        raw.published_text,
+                        raw.want_count,
+                        int(raw.free_shipping),
+                        json.dumps(list(raw.labels), ensure_ascii=False),
+                        int(raw.is_auction),
+                        int(raw.is_ad),
+                        json.dumps(raw.raw_payload, ensure_ascii=False)
+                        if raw.raw_payload is not None
                         else None,
-                        json.dumps(list(classification.flags), ensure_ascii=False),
-                        classification.item_kind,
-                        int(classification.excluded),
-                        json.dumps(list(classification.exclusion_reasons), ensure_ascii=False),
-                        int(classification.needs_review),
                     ),
                 )
                 self.conn.execute(
@@ -413,7 +469,12 @@ class Repository:
                     (cursor.lastrowid, product_id),
                 )
                 stored += 1
-        return StoreSummary(stored=stored, deduped=deduped, skipped_unidentifiable=skipped)
+        return StoreSummary(
+            stored=stored,
+            deduped=deduped,
+            skipped_unidentifiable=skipped,
+            untrusted_identity=untrusted,
+        )
 
     # -- 读取 --------------------------------------------------------------
 
@@ -450,23 +511,22 @@ class Repository:
         ).fetchall()
         return [_observation_record(row) for row in rows]
 
-    _ELIGIBLE_WHERE = (
-        "o.excluded = 0 AND o.needs_review = 0 AND o.price_parse_status = 'valid'"
-        " AND o.price_fen IS NOT NULL"
-    )
+    # 「有价格数字」而已，不是相关性筛选：解析不出价格的条目照样能通过
+    # /v1/products 拿到原文，只是无法参与算术。
+    _PRICED_WHERE = "o.price_parse_status = 'valid' AND o.price_fen IS NOT NULL"
 
     def run_products(
         self,
         run_id: str,
         *,
-        eligible_only: bool = False,
+        priced_only: bool = False,
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[list[ObservationRecord], int]:
         where = "o.run_id = ?"
         params: list[Any] = [run_id]
-        if eligible_only:
-            where += f" AND {self._ELIGIBLE_WHERE}"
+        if priced_only:
+            where += f" AND {self._PRICED_WHERE}"
 
         total = int(
             self.conn.execute(
@@ -500,11 +560,8 @@ class Repository:
                 canonical_url=row["canonical_url"],
                 price_fen=row["price_fen"],
                 price_status=row["price_parse_status"],
-                flags=_loads_tuple(row["flags_json"]),
-                item_kind=row["item_kind"],
-                excluded=bool(row["excluded"]),
-                exclusion_reasons=_loads_tuple(row["exclusion_reasons_json"]),
-                needs_review=bool(row["needs_review"]),
+                is_auction=bool(row["is_auction"]),
+                is_ad=bool(row["is_ad"]),
             )
             for row in rows
         ]

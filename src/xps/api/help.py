@@ -44,12 +44,18 @@ _CALL_FLOW = (
     {
         "method": "GET",
         "path": "/v1/products",
-        "purpose": "取本轮真实商品与可打开的原始链接（run_id 必填）",
+        "purpose": (
+            "取本轮商品的完整原始字段（描述、卖家信用、地址、平台标记、主图、链接）。"
+            "这是主要产出：run_id 必填"
+        ),
     },
     {
         "method": "GET",
         "path": "/v1/stats",
-        "purpose": "取中位数 / 分位数 / 样本量 / 排除原因（run_id 必填，绝不跨轮混合）",
+        "purpose": (
+            "取**未筛选**的中位数 / 分位数 / 样本量（run_id 必填，绝不跨轮混合）。"
+            "租赁、拍卖、配件、广告位都在样本里"
+        ),
     },
 )
 
@@ -64,8 +70,10 @@ _STATUS_VALUES = {
 
 _MUST_REPORT = (
     "价格口径：这是采集时刻的公开在售报价，不是成交价",
-    "样本量：eligible_count，以及 insufficient_sample 是否为真",
-    "排除情况：excluded_count、excluded_by_reason 分组、needs_review_count",
+    "样本量：priced_count，以及 insufficient_sample 是否为真",
+    "样本**未筛选**：sample_quality 恒含 unfiltered，租赁盘/拍卖起拍价/配件/广告位都在分布里",
+    "无价条目：unpriced_count 与 unpriced_by_status（面议/缺价格控件/无法解析）",
+    "平台标记：auction_count 与 ad_count",
     "可追溯链接：lowest_items 或商品列表里的 canonical_url",
     "采集时间与状态：started_at / ended_at / status / auth_mode / partial",
     "采集质量限制：sample_quality 数组原样转述",
@@ -73,6 +81,7 @@ _MUST_REPORT = (
 
 _MUST_NOT = (
     "不得把挂牌价说成成交价，也不得把「在售报价」表述为「市场行情」或「公允价」",
+    "不得把 stats 的分布说成已清洗过的结果——本服务不做相关性筛选，判断由你自己做",
     "不得把 status=failed 读成「平台没有商品」；空列表只在平台自报 hasItems=false 时才成立",
     "requires_human_action=true 时不得自动重试，必须把具体动作交还用户",
     "RATE_LIMITED / CHALLENGE_REQUIRED 时不得换账号、换代理或调小节流参数硬撞",
@@ -80,6 +89,51 @@ _MUST_NOT = (
     "不得跨 run_id 混合历史数据来凑样本量",
     "不得用图片或大模型推断未公开的商品参数来补齐规格",
 )
+
+# 透传字段清单。写死在这里而不是从 pydantic 反射，是为了给出**语义**而非只有字段名：
+# 调用方需要知道每个字段是平台原话还是本服务解析结果。
+_PASSTHROUGH = {
+    "principle": (
+        "本服务只做采集 + 清洗 + 去重，**不做相关性筛选**。"
+        "平台给出的字段原样透出，缺失即 null，不填占位值，不替调用方判断哪条商品可比。"
+    ),
+    "platform_verbatim": {
+        "title": "搜索页展示的单行标题（实测平台从不在此放换行）",
+        "description": "同一篇挂牌文字但保留换行分段，最长约 1500 字。判断租赁/配件/求购看这个",
+        "price.raw": "价格控件原文，如「¥5642.50」「面议」「¥90」",
+        "price.original_text": "划线原价原文（少数条目才有）",
+        "price.coupon_text": "券标签原文，如「券已抵50元」——展示价可能已扣券",
+        "seller.credit": "信用标签原文，实测「卖家信用极好」「卖家信用优秀」",
+        "seller.positive_rate": "好评率，如「39%」",
+        "seller.review_count": "评价数",
+        "seller.identity": "平台身份标识原文，如「闲鱼严选卖家」",
+        "area": "卖家所在地（省市粒度，平台只给到这个精度）",
+        "signals.published_text": "平台自报相对时间，如「8小时前发布」",
+        "signals.want_count": "想要人数",
+        "signals.labels": "徽标原文，实测「严选」「验货宝」",
+        "signals.free_shipping": "是否包邮",
+        "signals.is_auction": "拍卖位——起拍价不是普通在售报价",
+        "signals.is_ad": "广告位——不是自然搜索结果",
+        "media.image_url": "主图，每个商品只有 1 张",
+        "media.has_video": "是否带视频",
+    },
+    "derived_by_service": {
+        "price.yuan / price.fen": "价格解析结果，全程 Decimal；金额以字符串出 API",
+        "price.parse_status": "valid / ambiguous（面议、区间、租金）/ missing / invalid",
+        "canonical_url": "剥除跟踪参数后的可打开链接",
+        "observed_at": "本服务采集时刻（UTC）",
+    },
+    "not_available": {
+        "多张图片": (
+            "搜索响应每个商品只给 1 张主图。多图需商品详情接口 "
+            "mtop.taobao.idle.pc.detail（已从前端 bundle 核实存在，入参 {itemId}），"
+            "但 2026-09-22 实测 guest 身份调用直接返回 RGV587 风控挑战。"
+            "未登录拿不到，也不得绕过。"
+        ),
+        "成交价 / 历史价格": "平台搜索接口不返回；本服务也不做跨轮历史留存统计",
+        "精确地址": "平台只给到省市（area），没有更细粒度",
+    },
+}
 
 
 def _endpoints(spec: dict[str, Any]) -> list[dict[str, Any]]:
@@ -124,8 +178,10 @@ def build_help(app: Any, settings: Settings) -> dict[str, Any]:
         "service": _SERVICE_NAME,
         "version": __version__,
         "purpose": (
-            "在本地对闲鱼做真实搜索，把商品去重入库，按规格筛掉租赁/求购/配件/故障/定金占位等"
-            "非可比样本，给出可追溯的在售报价分布。单平台 MVP，只监听 127.0.0.1。"
+            "在本地对闲鱼做真实搜索，把商品去重入库，然后**原样透出**平台给出的字段"
+            "（完整描述、卖家信用、好评率、地址、想要人数、券抵扣、拍卖/广告标记、主图）"
+            "与价格解析结果。本服务不做相关性筛选——哪条商品可比由调用方判断。"
+            "另给出未筛选的算术分布（中位数/分位数）。单平台 MVP，只监听 127.0.0.1。"
         ),
         "price_semantics": {
             "what_it_is": "采集时刻的公开在售报价（挂牌价）",
@@ -143,7 +199,7 @@ def build_help(app: Any, settings: Settings) -> dict[str, Any]:
             "null_means": "字段缺失就是 null，服务不会填「暂无」之类的占位值",
         },
         "one_shot_client": (
-            'scripts/query-price.sh "富士 X-T4" --kind body --pages 2'
+            'scripts/query-price.sh "富士 X-T4" --pages 2'
             "  —— 已封装四步调用、超时、错误分诊与转述纪律；有 shell 权限时优先用它"
         ),
         "call_flow": list(_CALL_FLOW),
@@ -151,15 +207,18 @@ def build_help(app: Any, settings: Settings) -> dict[str, Any]:
         "search_request": {
             "content_type": "application/json",
             "fields": list(SearchSubmitRequest.model_fields),
-            "item_kind_values": ["body", "kit", "any"],
             "sort_values": ["newest", "price_asc", "price_desc", "default"],
             "unsupported_filters": list(UNVERIFIED_FILTERS),
             "unsupported_reason": (
                 "上游 SearchFilters 支持这些参数，但平台是否真按其过滤**未经实测验证**。"
                 "传非 null 会得到 422 UNSUPPORTED_FILTER，而不是被静默忽略或谎称已过滤。"
             ),
-            "item_kind_note": "item_kind 是**本地后置过滤**，不是平台过滤条件",
+            "no_relevance_filters": (
+                "本服务不接受任何相关性筛选参数（历史上的 item_kind 已移除）。"
+                "要按品类/成色/配置收窄，请自己读 /v1/products 的原始字段判断。"
+            ),
         },
+        "passthrough": dict(_PASSTHROUGH),
         "limits": {
             "max_pages_default": 1,
             "max_pages_ceiling": settings.max_search_pages,
@@ -260,12 +319,22 @@ def render_help_text(payload: dict[str, Any]) -> str:
         "",
         "【POST /v1/search 请求体】",
         "  字段: " + ", ".join(request["fields"]),
-        f"  item_kind: {' | '.join(request['item_kind_values'])}"
-        f"（{request['item_kind_note']}）",
         f"  sort: {' | '.join(request['sort_values'])}",
         "  暂不支持: " + ", ".join(request["unsupported_filters"]),
         f"    原因: {request['unsupported_reason']}",
+        f"  筛选: {request['no_relevance_filters']}",
     ]
+
+    passthrough = payload["passthrough"]
+    lines += ["", "【透传字段】", f"  {passthrough['principle']}", "", "  平台原话："]
+    for field, meaning in passthrough["platform_verbatim"].items():
+        lines.append(f"    {field:<26} {meaning}")
+    lines += ["", "  本服务解析结果："]
+    for field, meaning in passthrough["derived_by_service"].items():
+        lines.append(f"    {field:<26} {meaning}")
+    lines += ["", "  拿不到（别试错撞墙）："]
+    for field, meaning in passthrough["not_available"].items():
+        lines.append(f"    {field}: {meaning}")
 
     lines += ["", "【上限】"]
     for key, value in payload["limits"].items():

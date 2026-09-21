@@ -159,8 +159,41 @@ def test_cli_failure_rendering_uses_the_shared_action_text(code: str) -> None:
 def test_help_lists_what_the_agent_must_report(help_body) -> None:
     joined = " ".join(help_body["must_report"])
 
-    for required in ("口径", "样本量", "排除", "链接", "采集"):
+    for required in ("口径", "样本量", "未筛选", "链接", "采集"):
         assert required in joined
+
+
+def test_help_declares_the_service_does_not_filter(help_body) -> None:
+    """help 是 agent 的第一手说明书；不写清楚「不筛选」，它就会把分布当成清洗过的。"""
+    assert "不做相关性筛选" in help_body["passthrough"]["principle"]
+    assert any("不得把 stats" in item for item in help_body["must_not"])
+    assert "no_relevance_filters" in help_body["search_request"]
+
+
+def test_help_documents_the_passthrough_fields(help_body) -> None:
+    """调用方要靠这份清单知道自己能拿到哪些判断依据。"""
+    verbatim = help_body["passthrough"]["platform_verbatim"]
+
+    for field in (
+        "description",
+        "seller.credit",
+        "seller.positive_rate",
+        "seller.review_count",
+        "area",
+        "price.coupon_text",
+        "signals.is_auction",
+        "signals.is_ad",
+        "media.image_url",
+    ):
+        assert field in verbatim
+
+
+def test_help_states_what_cannot_be_obtained(help_body) -> None:
+    """多图的边界必须写明含实测结论，否则 agent 会反复去撞风控。"""
+    unavailable = help_body["passthrough"]["not_available"]
+
+    assert "多张图片" in unavailable
+    assert "RGV587" in unavailable["多张图片"]
 
 
 def test_help_lists_what_the_agent_must_not_do(help_body) -> None:

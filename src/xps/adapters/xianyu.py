@@ -15,11 +15,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sys
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from xps.adapters.base import (
     AUTH_GUEST,
@@ -35,7 +36,7 @@ from xps.services.identity import resolve_identity
 
 logger = logging.getLogger(__name__)
 
-ADAPTER_VERSION = "xps-xianyu/0.1.0"
+ADAPTER_VERSION = "xps-xianyu/0.2.0"
 
 # 上游 checkout 位置；许可未确认，永不 vendor 进本仓库
 DEFAULT_UPSTREAM_PATH = Path(__file__).resolve().parents[3] / "upstream" / "xianyu_spider"
@@ -45,9 +46,18 @@ RAW_PAYLOAD_MAX_BYTES = 4096
 _SOURCE_URL_BYTES = 2048
 _SHORT_FIELD_BYTES = 64
 _MAX_PRICE_PARTS = 6
+_MAX_TAG_LABELS = 12
 
 _PUBLISH_TIME_DIGITS = 13
 _FLEAMARKET_PREFIX = "fleamarket://"
+
+# 平台标签文案（fishTags / userFishShopLabel）的实测形态。
+# 只从中取数字，取不到就是 None——不按猜测填值。
+_FREE_SHIPPING_ICON = "freeShippingIcon"
+_WANT_RE = re.compile(r"(\d+)\s*人想要")
+_REVIEW_COUNT_RE = re.compile(r"(\d+)\s*条评价")
+_POSITIVE_RATE_RE = re.compile(r"好评率\s*(\d+(?:\.\d+)?\s*%)")
+_COUPON_MARKER = "券"
 
 
 def _truncate_bytes(text: str, limit: int) -> str:
@@ -101,13 +111,53 @@ def _image_url(value: Any) -> str | None:
     return f"https:{text}" if text.startswith("//") else text
 
 
+def _tag_labels(ex_content: Any, group: str) -> list[str]:
+    """`fishTags.<group>.tagList[].data.content`。
+
+    实测 r1/r2/r3/r4 四组标签的文案都落在同一个键 `data.content` 上，
+    所以这里只按组取文案，不对文案含义做任何推断——推断留给调用方。
+    """
+    tags = _path(ex_content, "fishTags", group, "tagList")
+    if not isinstance(tags, list):
+        return []
+    return [text for text in (_clean(_path(tag, "data", "content")) for tag in tags) if text]
+
+
+def _shop_labels(ex_content: Any) -> list[str]:
+    """`userFishShopLabel.tagList[].data.content`：实测为「N条评价」「好评率N%」。"""
+    tags = _path(ex_content, "userFishShopLabel", "tagList")
+    if not isinstance(tags, list):
+        return []
+    return [text for text in (_clean(_path(tag, "data", "content")) for tag in tags) if text]
+
+
+def _first_group_int(pattern: re.Pattern[str], texts: Sequence[str]) -> int | None:
+    for text in texts:
+        matched = pattern.search(text)
+        if matched:
+            return int(matched.group(1))
+    return None
+
+
+def _first_group_text(pattern: re.Pattern[str], texts: Sequence[str]) -> str | None:
+    for text in texts:
+        matched = pattern.search(text)
+        if matched:
+            return matched.group(1).replace(" ", "")
+    return None
+
+
 def _build_raw_payload(
     source_url: str | None,
     item_id: str | None,
     publish_time: str | None,
     parts: Any,
+    tag_labels: Sequence[str],
 ) -> dict[str, Any]:
     """最小必要原始字段。canonical_url 剥掉了跟踪参数，原始形态在此留档以便追溯。
+
+    `tag_labels` 是平台展示过的全部标签文案原文。已建模成独立字段的只是其中最常用的几个，
+    留档全量是为了平台新增标签时不会被静默丢掉。
 
     只放公开商品字段；Cookie / token / 用户身份一律不入内。
     """
@@ -127,8 +177,13 @@ def _build_raw_payload(
             for part in parts[:_MAX_PRICE_PARTS]
             if isinstance(part, dict)
         ]
+    if tag_labels:
+        payload["tag_labels"] = [
+            _truncate_bytes(label, _SHORT_FIELD_BYTES) for label in tag_labels[:_MAX_TAG_LABELS]
+        ]
     if len(json.dumps(payload, ensure_ascii=False).encode()) > RAW_PAYLOAD_MAX_BYTES:
         payload.pop("price_parts", None)
+        payload.pop("tag_labels", None)
     return payload
 
 
@@ -137,6 +192,7 @@ def entry_to_raw_listing(entry: Any) -> RawListing:
     main = _path(entry, "data", "item", "main")
     ex_content = _path(main, "exContent")
     click_args = _path(main, "clickParam", "args")
+    detail_params = _path(ex_content, "detailParams")
 
     source_url = _clean(_path(main, "targetUrl"))
     item_id = _clean(_path(ex_content, "itemId")) or _clean(_path(click_args, "item_id"))
@@ -144,6 +200,13 @@ def entry_to_raw_listing(entry: Any) -> RawListing:
 
     # 身份解析同时给出剥除跟踪参数后的 canonical_url
     canonical = resolve_identity(item_id, source_url).canonical_url or ""
+
+    badge_group = _tag_labels(ex_content, "r1")
+    published_group = _tag_labels(ex_content, "r2")
+    demand_group = _tag_labels(ex_content, "r3")
+    credit_group = _tag_labels(ex_content, "r4")
+    shop_group = _shop_labels(ex_content)
+    all_labels = badge_group + published_group + demand_group + credit_group + shop_group
 
     return RawListing(
         source_id=item_id,
@@ -156,7 +219,28 @@ def entry_to_raw_listing(entry: Any) -> RawListing:
         published_at=_publish_time_to_iso(_path(click_args, "publishTime")),
         is_auction=bool(_path(ex_content, "isAuction")),
         is_ad=bool(_path(ex_content, "isAliMaMaAD")),
-        raw_payload=_build_raw_payload(source_url, item_id, _clean(_path(click_args, "publishTime")), price_parts),
+        raw_payload=_build_raw_payload(
+            source_url,
+            item_id,
+            _clean(_path(click_args, "publishTime")),
+            price_parts,
+            all_labels,
+        ),
+        description=_clean(_path(detail_params, "title")),
+        original_price_text=_clean(_path(ex_content, "oriPrice")),
+        seller_avatar_url=_image_url(_path(ex_content, "userAvatarUrl")),
+        seller_identity=_clean(_path(ex_content, "userIdentityShow")),
+        seller_credit=credit_group[0] if credit_group else None,
+        seller_review_count=_first_group_int(_REVIEW_COUNT_RE, shop_group),
+        seller_positive_rate=_first_group_text(_POSITIVE_RATE_RE, shop_group),
+        published_text=published_group[0] if published_group else None,
+        want_count=_first_group_int(_WANT_RE, demand_group),
+        coupon_text=next(
+            (label for label in demand_group if _COUPON_MARKER in label), None
+        ),
+        free_shipping=_FREE_SHIPPING_ICON in badge_group,
+        labels=tuple(label for label in badge_group if label != _FREE_SHIPPING_ICON),
+        has_video=bool(_path(ex_content, "showVideoIcon")),
     )
 
 

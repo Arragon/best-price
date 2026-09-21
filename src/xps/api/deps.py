@@ -12,6 +12,29 @@ from xps.storage.repository import Repository, RunRecord
 # 这两种状态说明本轮没有可信结果；必须报错，不能退化成 200 + []
 _UNUSABLE_STATUSES = frozenset({"failed", "blocked_login"})
 
+# 已移除的筛选参数。FastAPI 默认**静默忽略**未声明的 query 参数，
+# 而拿着旧接口记忆传 item_kind=body 的调用方会以为结果已经筛过 —— 那是谎报口径。
+# 所以显式 422，和 UNSUPPORTED_FILTER 同一个理由。
+_REMOVED_FILTER_PARAMS = {
+    "item_kind": "本服务不再做单机身/套机之类的相关性筛选",
+    "eligible_only": "已改名 priced_only，且它只表示「价格能解析成数字」，不是相关性筛选",
+    "exclude_rental": "本服务不排除任何条目，租赁盘照常返回",
+    "flags": "分类标签体系已移除",
+}
+
+
+def reject_removed_filters(request: Request) -> None:
+    present = [name for name in _REMOVED_FILTER_PARAMS if name in request.query_params]
+    if not present:
+        return
+    detail = "；".join(f"{name}（{_REMOVED_FILTER_PARAMS[name]}）" for name in sorted(present))
+    raise ServiceError(
+        INVALID_QUERY,
+        f"以下参数已移除，不会被静默忽略：{detail}。"
+        "请改用 /v1/products 读原始字段自行判断可比性。",
+        status_code=422,
+    )
+
 
 def get_settings(request: Request) -> Settings:
     return request.app.state.settings

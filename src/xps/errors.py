@@ -105,8 +105,10 @@ AGENT_ACTIONS: dict[str, str] = {
     UPSTREAM_UNAVAILABLE: "上游不可用。检查网络、upstream/ checkout 是否存在、"
     "依赖是否装齐（scripts/setup.sh）。",
     DB_ERROR: "本地数据库错误。查看服务日志；必要时用 data/backups/ 里的备份恢复。",
-    NO_VALID_RESULTS: "本轮没有合格样本。查看 excluded_by_reason 与 needs_review_count，"
-    "考虑换关键词或放宽 item_kind。",
+    NO_VALID_RESULTS: "本轮没有任何价格可解析成数字的条目。/v1/stats 会以 200 返回 "
+    "priced_count=0，同时看 unpriced_by_status 判断是平台没给价格控件（missing）"
+    "还是给的是「面议 / 租金 / 区间」（ambiguous）。这不是被筛选掉的，"
+    "本服务不做相关性筛选；考虑换关键词或用 /v1/products 读原文自行判断。",
     RUN_INTERRUPTED: "服务曾在本轮采集中途重启，该 run 已判定为中断。请重新发起搜索。",
 }
 

@@ -40,7 +40,9 @@ def synthetic_listing(
     publish_time: str | None = "1789989232000",
     is_auction: bool = False,
     is_ad: bool = False,
+    **entry_kwargs,
 ) -> RawListing:
+    """entry_kwargs 直接透传给 make_entry，用来造带信用/描述/标签的合成商品。"""
     return entry_to_raw_listing(
         make_entry(
             item_id=item_id,
@@ -52,6 +54,7 @@ def synthetic_listing(
             is_auction=is_auction,
             is_ad=is_ad,
             target_url=f"fleamarket://item?id={item_id}&gulSource=search",
+            **entry_kwargs,
         )
     )
 

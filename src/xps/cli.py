@@ -22,8 +22,6 @@ EXIT_USAGE = 2
 EXIT_CRAWL_FAILED = 3
 EXIT_TIMEOUT = 4
 
-KIND_LABELS = {"body": "单机身", "kit": "套机", "any": "不限（可能混合配置）"}
-
 SORT_OPTIONS = ("newest", "price_asc", "price_desc", "default")
 
 _DEFAULT_STEP = "查看服务日志；必要时重跑 scripts/verify_upstream.py 核对上游接口。"
@@ -41,6 +39,39 @@ def _yuan(value: str | None) -> str:
     return f"¥{value}" if value else "—"
 
 
+def _seller_line(item: dict[str, Any]) -> str:
+    """把卖家侧信号压成一行：这些正是判断「这个报价可不可信」要看的。"""
+    seller = item.get("seller") or {}
+    signals = item.get("signals") or {}
+    parts = [str(seller.get("display_name")) if seller.get("display_name") else "卖家未知"]
+    if item.get("area"):
+        parts.append(str(item["area"]))
+    if seller.get("credit"):
+        parts.append(str(seller["credit"]))
+    rate = seller.get("positive_rate")
+    if rate and seller.get("review_count") is not None:
+        parts.append(f"好评率{rate}({seller['review_count']}评价)")
+    elif rate:
+        parts.append(f"好评率{rate}")
+    if seller.get("identity"):
+        parts.append(str(seller["identity"]))
+    marks = []
+    if signals.get("is_auction"):
+        marks.append("拍卖起拍价")
+    if signals.get("is_ad"):
+        marks.append("广告位")
+    price = item.get("price") or {}
+    if price.get("coupon_text"):
+        marks.append(str(price["coupon_text"]))
+    if price.get("parse_status") and price["parse_status"] != "valid":
+        marks.append(f"价格{price['parse_status']}")
+    if signals.get("want_count") is not None:
+        marks.append(f"{signals['want_count']}人想要")
+    if marks:
+        parts.append("⚠ " + "/".join(marks))
+    return " · ".join(parts)
+
+
 # ---------------------------------------------------------------- 渲染
 
 
@@ -51,40 +82,41 @@ def render_report(
     products: Sequence[dict[str, Any]],
     top: int = 5,
 ) -> str:
-    kind = stats.get("item_kind") or "any"
-    eligible = stats.get("eligible_count") or 0
+    priced = stats.get("priced_count") or 0
     lines: list[str] = [
-        f"══ 闲鱼在售报价 · {run.get('keyword')} · {KIND_LABELS.get(kind, kind)} ══",
+        f"══ 闲鱼在售报价 · {run.get('keyword')} ══",
         "",
         "口径：以下是**采集时刻的公开在售报价**，不是成交价，不含国补 / 优惠券 / 议价结果。",
+        "样本：**未筛选**。租赁盘、拍卖起拍价、配件、广告位全都在里面，由你自己判断可比性。",
         "",
     ]
 
-    if eligible:
-        lines.append(f"中位数 {_yuan(stats.get('median_yuan'))}    合格样本 {eligible} 件")
+    if priced:
+        lines.append(f"中位数 {_yuan(stats.get('median_yuan'))}    有价样本 {priced} 件")
         lines.append(
             f"  min {_yuan(stats.get('min_yuan'))} · P25 {_yuan(stats.get('p25_yuan'))}"
             f" · P75 {_yuan(stats.get('p75_yuan'))} · max {_yuan(stats.get('max_yuan'))}"
         )
     else:
-        lines.append("中位数 —    合格样本 0 件（无可用样本；这是筛选结果，不代表平台查不到商品）")
+        lines.append("中位数 —    有价样本 0 件（没有任何一条价格能解析成数字）")
 
+    unpriced = stats.get("unpriced_by_status") or {}
+    unpriced_text = (
+        " · ".join(f"{name} {count}" for name, count in sorted(unpriced.items()))
+        if unpriced
+        else "无"
+    )
     lines += [
         "",
         f"样本构成：原始 {stats.get('raw_count')} 条 → 去重 {stats.get('distinct_count')} 件",
-        f"  合格 {eligible} · 排除 {stats.get('excluded_count')}"
-        f" · 待核验 {stats.get('needs_review_count')}"
-        f" · 异常低价 {stats.get('suspicious_price_count')}",
+        f"  有价 {priced} · 无价 {stats.get('unpriced_count')}（{unpriced_text}）",
+        f"  其中平台标记：拍卖 {stats.get('auction_count')} · 广告位 {stats.get('ad_count')}",
+        "",
     ]
-    reasons = stats.get("excluded_by_reason") or {}
-    if reasons:
-        ordered = sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0]))
-        lines.append("  排除原因：" + " · ".join(f"{name} {count}" for name, count in ordered))
 
-    lines.append("")
     if stats.get("insufficient_sample"):
         lines.append(
-            f"⚠ 样本不足：合格样本 {eligible} 件 < 8。"
+            f"⚠ 样本不足：有价样本 {priced} 件 < 8。"
             "以上数字只反映已采集到的样本，不要据此下确定性结论。"
         )
     if stats.get("partial"):
@@ -93,12 +125,14 @@ def render_report(
     if quality:
         lines.append("采集质量限制：" + " · ".join(str(item) for item in quality))
 
-    entries = list(products[:top]) if products else list(stats.get("lowest_items") or [])
+    entries = list(products[:top])
     if entries:
-        lines += ["", "最低样本（可点开核对；链接已剥除跟踪参数）："]
+        lines += ["", f"最低 {len(entries)} 件（可点开核对；链接已剥除跟踪参数）："]
         for entry in entries:
             title = str(entry.get("title") or "(无标题)").replace("\n", " ")[:46]
-            lines.append(f"  {_yuan(entry.get('price_yuan')):>10}  {title}")
+            price = (entry.get("price") or {}).get("yuan")
+            lines.append(f"  {_yuan(price):>10}  {title}")
+            lines.append(f"{'':>13}{_seller_line(entry)}")
             if entry.get("canonical_url"):
                 lines.append(f"{'':>13}{entry['canonical_url']}")
 
@@ -111,8 +145,8 @@ def render_report(
         f"      adapter={run.get('adapter_version')}"
         f" · upstream_commit={run.get('source_commit')}",
         "",
-        "转述给用户时必须包含：口径（在售报价，非成交价）、样本量、排除原因、"
-        "采集质量限制、商品链接。",
+        "转述给用户时必须包含：口径（在售报价，非成交价）、样本量、样本未筛选这一事实、"
+        "采集质量限制、商品链接。要判断某条是否可比，用 /v1/products 读完整描述与卖家信用。",
     ]
     return "\n".join(lines)
 
@@ -193,7 +227,6 @@ def query(
     client: httpx.Client,
     *,
     keyword: str,
-    item_kind: str = "any",
     max_pages: int = 1,
     sort: str = "newest",
     min_price: str | None = None,
@@ -218,7 +251,6 @@ def query(
         "keyword": keyword,
         "max_pages": max_pages,
         "sort": sort,
-        "item_kind": item_kind,
     }
     if min_price is not None:
         payload["min_price_yuan"] = str(min_price)
@@ -249,11 +281,11 @@ def query(
     if run.get("status") in {"failed", "blocked_login"}:
         return QueryResult(EXIT_CRAWL_FAILED, render_failure(run), run=run)
 
-    params = {"run_id": run_id, "item_kind": item_kind}
     try:
-        stats = client.get("/v1/stats", params=params).json()
+        stats = client.get("/v1/stats", params={"run_id": run_id}).json()
         products = client.get(
-            "/v1/products", params={**params, "eligible_only": True, "limit": top}
+            "/v1/products",
+            params={"run_id": run_id, "priced_only": True, "limit": top},
         ).json()
     except (httpx.HTTPError, ValueError) as exc:
         return QueryResult(EXIT_USAGE, _service_down_text(f"取结果失败：{exc}"), run=run)
@@ -284,9 +316,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="闲鱼在售报价一键查询（POST → poll → stats → products）",
         epilog="退出码：0 成功 / 2 服务或参数问题 / 3 采集失败 / 4 轮询超时",
     )
-    parser.add_argument("keyword", help="搜索关键词，如「富士 X-T4」")
-    parser.add_argument("--kind", default="any", choices=sorted(KIND_LABELS),
-                        help="body=单机身 / kit=套机 / any=不限（默认）")
+    parser.add_argument("keyword", help="搜索关键词，如「富士 X-T4」「RTX 4090」")
     parser.add_argument("--pages", type=int, default=1, help="抓取页数，默认 1")
     parser.add_argument("--sort", default="newest", choices=SORT_OPTIONS)
     parser.add_argument("--min-price", help="最低价（元）")
@@ -301,7 +331,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = query(
             client,
             keyword=args.keyword,
-            item_kind=args.kind,
             max_pages=args.pages,
             sort=args.sort,
             min_price=args.min_price,

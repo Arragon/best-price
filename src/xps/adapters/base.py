@@ -25,7 +25,12 @@ SORT_OPTIONS = ("newest", "price_asc", "price_desc", "default")
 
 @dataclass(frozen=True)
 class RawListing:
-    """上游返回的原始条目，未做业务判断。"""
+    """上游返回的原始条目，未做业务判断。
+
+    本服务**不做相关性筛选**：这里只负责把平台真实给出的字段抽出来，
+    缺失一律为 None（不填占位值），判断交给调用方。
+    字段取值范围以 2026-09-22 抓取的 60 条真实搜索结果为据，见各字段注释。
+    """
 
     source_id: str | None
     url: str
@@ -35,10 +40,39 @@ class RawListing:
     area: str | None = None
     image_url: str | None = None
     published_at: str | None = None
-    # 实测 schema 里确实存在的两个字段：起拍价与广告位都不是普通在售报价
+    # 实测 schema 里确实存在的两个字段：起拍价与广告位都不是普通在售报价。
+    # 保留为**事实标记**而非排除依据——调用方自己决定怎么看待它们。
     is_auction: bool = False
     is_ad: bool = False
     raw_payload: dict | None = None
+
+    # detailParams.title：与 exContent.title 同文，但保留换行分段（实测 42/60 含换行，
+    # exContent.title 0/60）。挂牌描述常达 1500 字，分段版本才可读。
+    description: str | None = None
+    # exContent.oriPrice，划线原价；实测仅 6/30 条给出
+    original_price_text: str | None = None
+
+    seller_avatar_url: str | None = None
+    # exContent.userIdentityShow，如「闲鱼严选卖家」；实测 5/30 条给出
+    seller_identity: str | None = None
+    # fishTags.r4，如「卖家信用极好」「卖家信用优秀」；实测 56/60 条给出
+    seller_credit: str | None = None
+    # userFishShopLabel「318条评价」→ 318
+    seller_review_count: int | None = None
+    # userFishShopLabel「好评率39%」→「39%」
+    seller_positive_rate: str | None = None
+
+    # fishTags.r2，如「8小时前发布」——平台自报的相对时间，与 published_at 各自独立
+    published_text: str | None = None
+    # fishTags.r3「8人想要」→ 8
+    want_count: int | None = None
+    # fishTags.r3「券已抵50元」。关系价格口径：展示价可能已扣券，必须让调用方看见
+    coupon_text: str | None = None
+    # fishTags.r1 的 freeShippingIcon
+    free_shipping: bool = False
+    # fishTags.r1 其余标签，实测取值为「严选」「验货宝」
+    labels: tuple[str, ...] = ()
+    has_video: bool = False
 
 
 @dataclass(frozen=True)

@@ -19,13 +19,11 @@ from datetime import datetime, timezone
 import pytest
 
 from xps.adapters.xianyu import entry_to_raw_listing
-from xps.services.classify import build_model_spec
 from xps.services.normalize import normalize_listing
 from xps.storage.db import backup, connect, integrity_check, migrate
 from xps.storage.repository import Repository
 from tests.fixtures.mtop_entry import make_entry
 
-XT4 = build_model_spec("富士 X-T4")
 T1 = datetime(2026, 9, 22, 3, 0, 0, tzinfo=timezone.utc)
 T2 = datetime(2026, 9, 22, 4, 0, 0, tzinfo=timezone.utc)
 
@@ -49,6 +47,7 @@ def listing(
     title: str = "富士 X-T4 单机身",
     price: tuple[str, ...] = ("5499",),
     observed_at: datetime = T1,
+    **entry_kwargs,
 ):
     parts = [("sign", "¥")] + [("integer", text) for text in price]
     raw = entry_to_raw_listing(
@@ -57,9 +56,10 @@ def listing(
             title=title,
             price=parts,
             target_url=f"fleamarket://item?id={item_id}",
+            **entry_kwargs,
         )
     )
-    return normalize_listing(raw, spec=XT4, observed_at=observed_at)
+    return normalize_listing(raw, observed_at=observed_at)
 
 
 def new_run(repo: Repository, run_id: str, **kwargs) -> None:
@@ -227,7 +227,7 @@ def test_ambiguous_price_stores_null_not_zero(repo) -> None:
         )
     )
     repo.store_listings(
-        "r1", [normalize_listing(raw, spec=XT4, observed_at=T1)], page_number=1
+        "r1", [normalize_listing(raw, observed_at=T1)], page_number=1
     )
 
     stored = repo.observations_of("xianyu:item:7002")[0]
@@ -242,7 +242,7 @@ def test_missing_title_is_stored_as_null_not_placeholder(repo) -> None:
     raw = entry_to_raw_listing(
         make_entry(item_id="7003", title=None, target_url="fleamarket://item?id=7003")
     )
-    repo.store_listings("r1", [normalize_listing(raw, spec=XT4, observed_at=T1)], page_number=1)
+    repo.store_listings("r1", [normalize_listing(raw, observed_at=T1)], page_number=1)
 
     stored = repo.observations_of("xianyu:item:7003")[0]
     assert stored.title_raw is None
@@ -252,7 +252,7 @@ def test_missing_title_is_stored_as_null_not_placeholder(repo) -> None:
 def test_unstorable_listing_is_skipped_and_counted(repo) -> None:
     new_run(repo, "r1")
     broken = entry_to_raw_listing(make_entry(item_id=None, target_url=None, title=None))
-    normalized = normalize_listing(broken, spec=XT4, observed_at=T1)
+    normalized = normalize_listing(broken, observed_at=T1)
 
     summary = repo.store_listings("r1", [normalized], page_number=1)
 
@@ -262,8 +262,9 @@ def test_unstorable_listing_is_skipped_and_counted(repo) -> None:
     assert repo.count_products() == 0
 
 
-def test_untrusted_host_listing_is_stored_but_excluded(repo) -> None:
-    """身份不可信时保留记录以便追溯，但打标排除，不进可信统计。"""
+def test_untrusted_host_listing_is_stored_and_counted(repo) -> None:
+    """身份不可信（主机不在实测白名单）时仍入库——它是平台真实返回的条目，
+    但没有可点开的追溯链接，故计数上报，不静默混进「都有链接」的假象。"""
     from xps.adapters.base import RawListing
 
     new_run(repo, "r1")
@@ -273,11 +274,17 @@ def test_untrusted_host_listing_is_stored_but_excluded(repo) -> None:
         title="富士 X-T4 单机身",
         price_text="¥5499",
     )
-    repo.store_listings("r1", [normalize_listing(raw, spec=XT4, observed_at=T1)], page_number=1)
 
-    items = repo.stats_items("r1")
-    assert len(items) == 1
-    assert items[0].excluded is True
+    summary = repo.store_listings(
+        "r1", [normalize_listing(raw, observed_at=T1)], page_number=1
+    )
+
+    assert summary.stored == 1
+    assert summary.untrusted_identity == 1
+    rows, total = repo.run_products("r1")
+    assert total == 1
+    assert rows[0].canonical_url is None, "主机不可信 → 造不出可点开的追溯链接"
+    assert rows[0].price_fen == 549_900
 
 
 # ---------------------------------------------------------------- run 生命周期
@@ -324,7 +331,7 @@ def test_finish_run_records_layered_counts(repo) -> None:
         pages_fetched=1,
         raw_count=30,
         stored_count=28,
-        eligible_count=9,
+        priced_count=9,
         auth_mode="guest",
         warnings=("page_2_failed:UPSTREAM_TIMEOUT",),
         error_code="UPSTREAM_TIMEOUT",
@@ -335,7 +342,7 @@ def test_finish_run_records_layered_counts(repo) -> None:
     assert run.status == "partial"
     assert run.pages_requested == 2
     assert run.pages_fetched == 1
-    assert (run.raw_count, run.stored_count, run.eligible_count) == (30, 28, 9)
+    assert (run.raw_count, run.stored_count, run.priced_count) == (30, 28, 9)
     assert run.warnings == ("page_2_failed:UPSTREAM_TIMEOUT",)
     assert run.error_code == "UPSTREAM_TIMEOUT"
     assert run.ended_at is not None
@@ -379,18 +386,108 @@ def test_run_products_paginates_and_reports_total(repo) -> None:
     assert {row.product_id for row in page} & {row.product_id for row in second_page} == set()
 
 
-def test_run_products_eligible_only_filters_excluded(repo) -> None:
+def test_run_products_priced_only_keeps_only_parseable_prices(repo) -> None:
+    """priced_only 只是「价格能解析成数字」，不是相关性筛选。
+
+    被它挡掉的条目仍能用 priced_only=false 取到，价格原文一并保留。
+    """
     new_run(repo, "r1")
     repo.store_listings(
         "r1",
-        [listing("7001"), listing("7002", title="X-T4 电池", price=("50",))],
+        [
+            listing("7001"),
+            listing("7002", title="富士 X-T4 定金链接", price=("定金200",)),
+            listing("7003", title="富士 X-T4 电池", price=("50",)),
+        ],
         page_number=1,
     )
 
-    page, total = repo.run_products("r1", eligible_only=True)
+    priced, priced_total = repo.run_products("r1", priced_only=True)
+    everything, everything_total = repo.run_products("r1", priced_only=False)
 
-    assert total == 1
-    assert page[0].title == "富士 X-T4 单机身"
+    assert priced_total == 2, "¥50 的电池照样是有价条目——本服务不判断它可不可比"
+    assert {row.title for row in priced} == {"富士 X-T4 单机身", "富士 X-T4 电池"}
+    assert everything_total == 3
+    ambiguous = next(row for row in everything if row.price_fen is None)
+    assert ambiguous.price_raw == "¥定金200"
+    assert ambiguous.price_parse_status == "ambiguous"
+
+
+def test_platform_fields_round_trip_through_the_database(repo) -> None:
+    """透传字段必须真的落库、真的读得回来——少存一列 agent 就少一份判断依据。"""
+    new_run(repo, "r1")
+    repo.store_listings(
+        "r1",
+        [
+            listing(
+                "7001",
+                description="富士 X-T4 单机身\n无拆无修\n配件：电池2块",
+                credit="卖家信用优秀",
+                review_count=318,
+                positive_rate="39%",
+                seller_identity="闲鱼严选卖家",
+                published_text="6小时前发布",
+                want_count=8,
+                coupon_text="券已抵50元",
+                free_shipping=True,
+                badges=("验货宝",),
+                ori_price="¥6999",
+                has_video=True,
+                is_auction=True,
+                is_ad=True,
+            )
+        ],
+        page_number=1,
+    )
+
+    row = repo.observations_of("xianyu:item:7001")[0]
+
+    assert row.description == "富士 X-T4 单机身\n无拆无修\n配件：电池2块"
+    assert row.seller_credit == "卖家信用优秀"
+    assert row.seller_review_count == 318
+    assert row.seller_positive_rate == "39%"
+    assert row.seller_identity == "闲鱼严选卖家"
+    assert row.seller_avatar_url == "https://img.example.invalid/synthetic-avatar.jpg"
+    assert row.published_text == "6小时前发布"
+    assert row.want_count == 8
+    assert row.coupon_text == "券已抵50元"
+    assert row.free_shipping is True
+    assert row.labels == ("验货宝",)
+    assert row.original_price_text == "¥6999"
+    assert row.has_video is True
+    assert row.is_auction is True
+    assert row.is_ad is True
+
+
+def test_absent_platform_fields_round_trip_as_null(repo) -> None:
+    """缺失就是 NULL，不得被 DEFAULT 0 伪造成「零评价 / 零想要」。"""
+    new_run(repo, "r1")
+    repo.store_listings(
+        "r1",
+        [
+            listing(
+                "7001",
+                credit=None,
+                review_count=None,
+                positive_rate=None,
+                published_text=None,
+                avatar_url=None,
+            )
+        ],
+        page_number=1,
+    )
+
+    row = repo.observations_of("xianyu:item:7001")[0]
+
+    assert row.seller_credit is None
+    assert row.seller_review_count is None
+    assert row.seller_positive_rate is None
+    assert row.published_text is None
+    assert row.seller_avatar_url is None
+    assert row.want_count is None
+    assert row.coupon_text is None
+    assert row.free_shipping is False
+    assert row.labels == ()
 
 
 def test_stats_items_expose_what_statistics_needs(repo) -> None:

@@ -1,6 +1,6 @@
 [project]
 name = "xianyu-price-service"
-version = "0.1.0"
+version = "0.2.0"
 description = "本地闲鱼商品搜索与在售报价统计服务（单平台 MVP，仅监听 127.0.0.1）"
 requires-python = ">=3.12"
 # 注意：上游 xianyu_spider 的依赖刻意不在此声明。

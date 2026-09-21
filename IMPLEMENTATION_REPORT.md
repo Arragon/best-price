@@ -5,6 +5,190 @@
 
 ---
 
+## ⚠️ 2026-09-22 架构改造：移除相关性分类筛选层
+
+**本节是最新事实，优先级高于下文所有历史章节。** 下文中描述规则分类器（`classify.py`）、
+标签体系、`item_kind` / `eligible_only` / `excluded_by_reason` / IQR 围栏的段落，
+均已按段落加了失效标注，但**原始测量数据一律保留**，不改写、不删除。
+
+### 改了什么
+
+删除整个「相关性分类筛选层」，改为把平台字段**清洗后原样透传**给调用方（agent），
+由 agent 自己判断哪条商品可比。
+
+| 项 | 变化 |
+|---|---|
+| `src/xps/services/classify.py`、`tests/test_classify.py` | **已删除** |
+| 版本 | `0.1.0` → **`0.2.0`**（`xps.__version__`）；`ADAPTER_VERSION` `xps-xianyu/0.1.0` → **`xps-xianyu/0.2.0`** |
+| `SCHEMA_VERSION` | 1 → **2**（加法迁移，见下） |
+| IQR 异常低价围栏 | **一并删除**（那同样是筛选）。最低/最高各 3 件照实列出 |
+
+### 为什么删：词表只对相机成立
+
+旧分类器靠「单机身 / 套机 / 机身盖 / 遮光罩」这类**相机词汇**判断商品配置。
+非相机品类根本没有这些词，于是所有条目都被打成 `unknown_variant` 送进 review，统计样本直接归零。
+更糟的是 `model_mismatch` 的判定逻辑：「标题里没原样出现关键词的型号 token 就排除」——
+这是把**证据缺失当成了证据存在**。
+
+下表每行是一轮真实搜索，数据取自仓库里的真实 SQLite 库 `data/price.sqlite3`
+（含此前多轮真实抓取的历史数据）。「旧合格」= 旧筛选器允许进入统计的条数
+（老库 `search_runs.eligible_count` 落库值）；「新有价」= 现版本 `compute_stats`
+在**同一批已入库 observations** 上重算出的 `priced_count`：
+
+| 关键词 | 总条数 | 旧合格 | 新有价 | 旧筛选器主要排除原因 |
+|---|---|---|---|---|
+| 富士 X-T4 | 60 | 14 | 60 | `rental_or_lease` 22、`deposit_or_placeholder` 21、`needs_review` 15、`wanted_to_buy` 6、`model_mismatch` 3 |
+| 富士 X-T4 | 30 | 4 | 30 | `rental_or_lease` 16、`deposit_or_placeholder` 15、`needs_review` 6、`accessory_only` 3、`model_mismatch` 2 |
+| xs10相机 | 59 | **0** | 58 | **`model_mismatch` 59（全部）**、`rental_or_lease` 30、`accessory_only` 11 |
+| 富士 XS10 | 90 | 52 | 90 | `accessory_only` 21、`needs_review` 12、`model_mismatch` 2 |
+| 27寸 4K 144Hz 显示器 | 60 | 4 | 60 | **`needs_review` 44**、`repair_or_fault` 8、`model_mismatch` 4 |
+| 27寸4K显示器 电竞 | 90 | **0** | 90 | **`model_mismatch` 87**、`needs_review` 3 |
+| 富士X-T4 | 30 | 15 | 30 | `model_mismatch` 11、`needs_review` 3 |
+
+两个显示器关键词几乎全军覆没（90 → 0、60 → 4），`xs10相机` 59 条**全部**被 `model_mismatch` 干掉。
+排除原因分布按老库 `observations.exclusion_reasons_json` 与 `needs_review` 逐条聚合而来
+（这些列在老库里物理上仍在，代码已不再读写）。
+
+### 代价（如实记录，不只报喜）
+
+不筛选意味着分布里混进了不可比条目。同一批真实数据上，现版本算出的**未筛选**中位数：
+
+| 关键词 | 未筛选中位数 | 说明 |
+|---|---|---|
+| 富士 X-T4（30 条那轮） | **¥80.00** | 那一轮里全是 ¥40 / ¥50 / ¥90 的日租盘 |
+| xs10相机 | **¥325.00** | 混进了配件 |
+| 27寸 4K 144Hz 显示器 | ¥233.50 | — |
+| 27寸4K显示器 电竞 | ¥820.00 | — |
+| 富士 XS10 | ¥5000.00 | — |
+| 富士X-T4 | ¥5399.00 | — |
+
+「富士 X-T4 中位数 ¥80」显然荒谬，但它**如实反映了那一轮平台返回的东西**。
+所以新契约是：**服务端只给事实和算术，判断可比性是调用方（agent）的责任**，
+而且它现在有足够字段做这个判断（见下）。
+
+### 新透传的字段
+
+搜索响应里本来就带这些，旧代码没抽。覆盖率基于 `data/probe/raw_富士_X-T4_p1a_p1.json` +
+`…_p1b_p1.json` 两页共 **60 条真实抓取样本**：
+
+| 字段 | 平台来源 | 实测覆盖 |
+|---|---|---|
+| `description` | `detailParams.title` | 60/60 有值；**42/60 含换行**（`exContent.title` 含换行 **0/60**）；长度 46–1511 字。判断租赁/配件/求购主要靠它 |
+| `seller.credit` | `fishTags.r4[].data.content` | 56/60：「卖家信用极好」42、「卖家信用优秀」14 |
+| `seller.review_count` / `positive_rate` | `userFishShopLabel.tagList[].data.content` | 60/60；形如「318条评价」「好评率39%」 |
+| `area` | `exContent.area` | 60/60；**只到省市**，平台不给更细 |
+| `signals.published_text` | `fishTags.r2` | 60/60；形如「8小时前发布」 |
+| `signals.want_count` | `fishTags.r3` | 6/60；形如「8人想要」 |
+| `price.coupon_text` | `fishTags.r3` | 10/60；形如「券已抵50元」。**关系价格口径：展示价可能已扣券** |
+| `signals.free_shipping` | `fishTags.r1` 的 `freeShippingIcon` | 32/60 |
+| `signals.labels` | `fishTags.r1` 其余标签 | 「严选」10/60、「验货宝」4/60 |
+| `seller.identity` | `exContent.userIdentityShow` | 10/60（「闲鱼严选卖家」） |
+| `price.original_text` | `exContent.oriPrice` | 12/60（划线原价） |
+| `seller.avatar_url` | `exContent.userAvatarUrl` | 60/60 |
+| `media.has_video` | `exContent.showVideoIcon` | 4/60 为真 |
+| `media.image_url` | `exContent.picUrl` | 60/60（**只有 1 张主图**） |
+| `signals.is_auction` / `is_ad` | `exContent.isAuction` / `isAliMaMaAD` | 该批 0/60、0/60 |
+
+另核实：`detailParams.soldPrice` 与价格控件三段拼接（`sign`/`integer`/`decimal`）在 **60/60** 条上
+一致（`soldPrice` 是不带 `¥` 的数值形态）。故价格仍沿用已测过的三段解析，
+**未**引入 `soldPrice` 这个冗余来源。
+
+### 多图探测：**做不到**（已实测到风控边界即停手）
+
+搜索响应每件商品**只有 1 张主图**。从闲鱼 PC 站前端 bundle
+`https://g.alicdn.com/idle-pc/xy-site/0.0.175/js/p_item-index.js` 里核实出真实详情接口是
+`mtop.taobao.idle.pc.detail`，版本 `1.0`，入参 `{itemId}`。
+但 2026-09-22 用 guest 身份实调，返回 `RGV587_ERROR::SM::哎哟喂,被挤爆啦,请稍后重试!`
+—— 阿里的风控/滑块挑战码。按项目红线**立即停手，没有重试、没有绕过**。
+
+- 结论：**未登录拿不到多图**；**登录后能否拿到未实测**（已补入 `NOT_VERIFIED_LIVE` 清单）。
+- 顺带记录：`https://www.goofish.com/item?id=…` 与 `https://h5.m.goofish.com/item?id=…`
+  都是客户端渲染空壳（分别 **10574 / 3983 字节**），HTML 里没有内嵌商品数据。
+
+### API 契约变化（**破坏性**）
+
+| 端点 | 变化 |
+|---|---|
+| `POST /v1/search` | 请求体**移除** `item_kind`。因 `extra="forbid"`，传它会得到 `422 INVALID_QUERY` |
+| `GET /v1/stats` | **移除** `item_kind` 查询参数。删除 `item_kind`、`eligible_count`、`excluded_count`、`excluded_by_reason`、`needs_review_count`、`suspicious_price_count`；新增 `priced_count`、`unpriced_count`、`unpriced_by_status`（按 `ambiguous`/`missing`/`invalid` 分组）、`auction_count`、`ad_count`、`highest_items`。`sample_quality` **恒含 `unfiltered`**。保留 `min/p25/median/p75/max`（`_yuan` 字符串与 `_fen` 整数两种形态）、`lowest_items`、`insufficient_sample`、`raw_count`、`distinct_count`、`partial`。**分位数算法未变**（inclusive 线性插值、全程 Decimal、ROUND_HALF_UP 取整到分） |
+| `GET /v1/products` | `eligible_only` **改名** `priced_only`，语义是「价格能解析成数字」，不是相关性筛选。item 结构改为嵌套：`price{raw,yuan,fen,parse_status,original_text,coupon_text}`、`seller{display_name,credit,review_count,positive_rate,identity,avatar_url}`、`media{image_url,has_video}`、`signals{published_text,want_count,free_shipping,labels,is_auction,is_ad}`，外加顶层 `product_id`、`source_run_id`、`observed_at`、`canonical_url`、`title`、`description`、`area`、`published_at`。删除 `flags`、`item_kind`、`excluded`、`exclusion_reasons`、`needs_review`、`price_text`、`price_yuan`、`seller_display_name`、`image_url`（后四者移入嵌套对象） |
+| `GET /v1/search-runs/{run_id}` | `eligible_count` **改名** `priced_count` |
+| `GET /help` | 新增 `passthrough` 段（分「平台原话」/「本服务解析结果」/「拿不到」三类）；`must_report`（8 项）与 `must_not`（8 条）已围绕「未筛选」重写 |
+| CLI（`python -m xps.cli` / `scripts/query-price.sh`） | 移除 `--kind`。报告新增未筛选声明、无价条目分组、拍卖/广告计数，并把卖家信用 + 好评率 + 券抵扣打在每条最低价样本旁边 |
+| `errors.py` | `NO_VALID_RESULTS` 的 agent 行动指引已改写（不再提 `excluded_by_reason` / `item_kind`），改为指向 `unpriced_by_status` |
+
+**新增防呆**：`/v1/products` 与 `/v1/stats` 会**显式 422 拒绝**已移除的筛选参数
+（`item_kind`、`eligible_only`、`exclude_rental`、`flags`），而不是像 FastAPI 默认那样静默忽略 ——
+因为拿着旧接口记忆传 `item_kind=body` 的调用方会误以为结果已经筛过，那是谎报口径。
+实现在 `src/xps/api/deps.py` 的 `reject_removed_filters`。
+
+### 存储层变化
+
+- `observations` **新增 15 列**：`description`、`original_price_text`、`coupon_text`、
+  `seller_credit`、`seller_review_count`、`seller_positive_rate`、`seller_identity`、
+  `seller_avatar_url`、`has_video`、`published_text`、`want_count`、`free_shipping`、
+  `labels_json`、`is_auction`、`is_ad`。
+- **不再写入**：`flags_json`、`item_kind`、`excluded`、`exclusion_reasons_json`、`needs_review`。
+  这些列在**老库里物理上仍然存在** —— 迁移是加法的，SQLite 删列要重写整表，
+  为几列死数据冒这个险不值当；代码不再读写它们。新建库的 `schema.sql` 里已无这些列。
+- `search_runs.eligible_count` 通过 `ALTER TABLE … RENAME COLUMN` 改名为 `priced_count`。
+- `store_listings` 新增 `untrusted_identity` 计数（身份不可信、造不出 `canonical_url` 的条目），
+  由 `search_service` 写成 run 的 `untrusted_identity:N` 警告。这类条目**仍入库**。
+  既无平台 ID 又无可信 URL 的条目仍 `storable=False` 不入库，计 `skipped_unidentifiable:N`
+  —— 那是数据完整性约束（否则 `identity_key` 全碰撞成 `sha256("")` 同一行），不是相关性筛选。
+
+**迁移验证**（在真实库 `data/price.sqlite3` 的副本上执行 `_migrate_additive`）：
+
+- `PRAGMA user_version` 1 → 2；`PRAGMA integrity_check` → **`ok`**
+- **332 个 products / 419 个 observations 全部保留**，行数迁移前后一致
+- 重复执行**无副作用**（加列前先查 `PRAGMA table_info`）
+- 老 run 仍能正常读出；老行的新字段为 `NULL` —— 这是诚实的，那些字段当时没采集
+
+> ⚠️ 一处**已知不一致**（如实记录）：`RENAME COLUMN` 保留旧值，所以改造**前**跑的老 run，
+> `priced_count` 列里躺着的仍是旧筛选口径的数值。实测 run `b1ad3465…`：
+> `GET /v1/search-runs/{run_id}` 返回 `priced_count: 14`，而 `GET /v1/stats?run_id=…`
+> 对同一 run 现算返回 `priced_count: 60`。`/v1/stats` 永远从 `observations` 重算，不受影响；
+> 老 run 的正确计数以 `/v1/stats` 为准。未做数据回填（回填等于用今天的口径改写历史记录）。
+
+### 保留下来的（不是「全删了」）
+
+- **`parse_price`**：全程 Decimal 的价格解析（`float(1.15)*10000 == 11499.999999999998` 那个坑）
+  与 `valid`/`ambiguous`/`missing`/`invalid` 四态。**这不是筛选**：解析不出数字时原文照样保留、
+  条目照样返回，只是不参与算术，并按状态计入 `unpriced_by_status`。
+- **`resolve_identity`**：身份键与去重（平台商品 ID → 可信 URL 稳定参数 → 剥跟踪参数后的 URL SHA-256）。
+- 单实例串行锁、逐页节流、任务状态全落库、进程重启判定 `RUN_INTERRUPTED`、只监听 loopback、
+  失败不退化成 `200 + 空列表`。
+- 上游许可红线不变：`upstream/xianyu_spider` 无 LICENSE 文件，**永不 vendor**，
+  只以独立 checkout + 进程内 import 调用。
+
+### 测试现状
+
+```
+$ .venv/bin/python -m pytest -q
+323 passed, 4 deselected in 5.16s
+```
+
+（4 个 deselected 是标了 `live` 的真实网络测试，默认不跑。改造前为 `359 passed, 4 deselected`，
+在 HEAD 的独立 worktree 上实测；差额构成为 `tests/test_classify.py` 的 **59 条**随分类层删除，
+其余测试文件为适配新契约净增 **23 条**：359 − 59 + 23 = 323。）
+
+新增的契约守护用例：
+
+| 用例 | 守什么 |
+|---|---|
+| `tests/test_stats.py::test_a_cheap_outlier_stays_in_the_arithmetic` | ¥50 的条目必须留在算术里，防止 IQR 剔除悄悄回来 |
+| `tests/test_stats.py::test_result_is_always_marked_unfiltered` | `sample_quality` 恒含 `unfiltered` |
+| `tests/test_api_contract.py::test_relevance_filters_are_not_accepted_at_all` | 已移除的筛选参数必须 422，不得静默忽略 |
+
+改造后另有一轮真实采集落库可供追溯：run `026babbc-6e7e-4db0-bb83-691805172f64`
+（关键词 `RTX 4090`，1 页，`adapter_version=xps-xianyu/0.2.0`，`raw_count=30`、`priced_count=30`、
+`status=succeeded`，库中记录 `auth_mode=logged_in`）。未筛选中位数 ¥23250.00，
+而 `lowest_items` 前 3 件里有 2 件其实是 **RTX 4060**（¥2289 / ¥2399）——
+这正是「服务端不筛选、判断归调用方」的字面示例。
+**登录后与 guest 的结果集差异仍未做系统对比**，见 `NOT_VERIFIED_LIVE`。
+
+---
+
 ## 基本信息
 
 - **日期/系统/设备**：2026-09-22（Asia/Taipei）/ macOS 26.6.2 (Build 25G83), Darwin arm64 / 本机 MacBook（用户 `aragon_magic`）
@@ -47,6 +231,9 @@ Playwright + Web UI + AI 分析的重型监控系统，面向持续监控而非�
 | `xianyu.mtop.search(keyword, page, filters)` —— 单页 mtop 请求与签名，返回**完整原始 JSON** | 原始 JSON → `RawListing` 解析（上游 `handle_data` 会注入「暂无」「价格异常」占位伪数据，且用 float 换算「万」） |
 | `xianyu.mtop.probe_login()` —— 登录态探测 | 身份键（上游 `get_link_unique_key` 用 `link.split("&",1)[0]`，指南 §7 明令禁止） |
 | `xianyu.search_query.SearchFilters` —— 筛选参数构造 | 价格解析、相关性分类、统计、SQLite 持久化、HTTP API |
+
+> ⚠️ 上表「相关性分类」一项已于 **2026-09-22 移除**（`src/xps/services/classify.py` 已删除），
+> 现由「平台字段清洗后原样透传 + 调用方自行判断」取代。其余四项不变。见文首改造章节。
 
 **刻意不走**的三条路：
 - 选项 B（上游 HTTP `POST /search/`）：**实测证伪**。该端点只返回 `total_results` / `new_records` / `new_record_ids`，拿不到本轮商品。
@@ -109,6 +296,10 @@ Playwright + Web UI + AI 分析的重型监控系统，面向持续监控而非�
 - <https://www.goofish.com/item?id=1085916193246> —— ¥5642.50「富士 X-T4_银色 经检测…」
 - <https://www.goofish.com/item?id=1086948380894> —— ¥90「#重庆同城#索尼a7m4/a7m3/a7c2/a7r3免押租赁」（**租赁盘**，被 `rental_or_lease` 正确排除）
 
+> ⚠️ 上条括注里的 `rental_or_lease` 标签已于 **2026-09-22 随分类层移除**：这类租赁盘现在
+> **照常入库、照常进入未筛选算术**，改由调用方读 `description` 自行判断。
+> 链接与价格本身是真实采集记录，保留不改。
+
 ## 二页及重抓：**pass**
 
 | 轮次 | 参数 | 结果 |
@@ -158,6 +349,10 @@ $ .venv/bin/python -m pytest -q
 
 ## HTTP API：**pass**
 
+> ⚠️ 下表 `/v1/products` 与 `/v1/stats` 两行的参数与响应内容已于 **2026-09-22 改变**
+> （`eligible_only` → `priced_only`；`item_kind` 与全部排除原因字段移除，改为未筛选口径 +
+> 透传字段）。以下为历史实施记录，当前契约见文首「API 契约变化」与 `README.md`。
+
 接口清单（全部实现并有契约测试）：
 
 | 方法 | 路径 | 说明 |
@@ -188,7 +383,17 @@ $ .venv/bin/python -m pytest -q
 **真实端到端验证**：`scripts/smoke-local.sh "富士 X-T4" 2 any` 于 2026-09-22 跑通完整链路
 （health → auth/status → POST → poll → products → stats），输出见 README「统计方法」一节的真实响应。
 
+> ⚠️ 该行已失效两处：`smoke-local.sh` 现在只接受「关键词 + 页数」两个参数（第三个 `any`
+> 是已移除的 `item_kind`）；引用的 README 响应也已换成未筛选口径的新结构。
+> 链路本身（health → auth/status → POST → poll → products → stats）不变。
+
 ## Agent 客户端：**pass**
+
+> ⚠️ 本节描述的 `render_report()` 输出内容已于 **2026-09-22 改写**：`excluded_by_reason` 分组与
+> `needs_review_count` 已随分类层移除，替换为「样本未筛选」声明、`unpriced_count` /
+> `unpriced_by_status` 分组、`auction_count` / `ad_count`，并在每条最低价样本旁打印
+> 卖家信用 + 好评率 + 券抵扣。「合格样本为 0」的分支改为「有价样本 0 件」。
+> 以下为历史实施记录，`--kind` 参数亦已移除。
 
 新增 `src/xps/cli.py` + `scripts/query-price.sh`：一条命令完成 `POST → poll → stats → products`。
 
@@ -196,6 +401,8 @@ $ .venv/bin/python -m pytest -q
 $ .venv/bin/python -m pytest -q tests/test_cli.py
 29 passed
 ```
+
+（改造后重跑：**32 passed**，2026-09-22。上面的 `29 passed` 是改造前的历史记录。）
 
 设计重点是**把转述纪律固化成代码**，而不是靠提示词约束 agent：
 
@@ -242,6 +449,8 @@ $ .venv/bin/python -m pytest -q tests/test_help.py
 33 passed
 ```
 
+（改造后重跑：**36 passed**，2026-09-22。上面的 `33 passed` 是改造前的历史记录。）
+
 动机：OpenAPI 只描述「有什么参数」，不传达**价格口径纪律**与「遇到某个错误码该怎么办」。
 `GET /help` 补上这两类信息，让 agent 不必先读 README 就能正确使用本服务。
 `?format=text` 输出纯文本，便于直接塞进模型上下文。
@@ -250,6 +459,11 @@ $ .venv/bin/python -m pytest -q tests/test_help.py
 价格口径（是什么/不是什么/单位/分位数算法/null 语义）、一条命令入口、四步调用流程、
 端点清单（含 POST 请求体的必填字段与全部字段）、上限、任务状态语义、失败语义、
 错误码 → `agent_action`、转述必含项、禁止项、登录说明。
+
+> ⚠️ 上述计数已于 **2026-09-22 变化**：`must_report` 6 → **8** 条、`must_not` 7 → **8** 条，
+> 均已围绕「样本**未筛选**」重写；另新增 `passthrough` 段（分「平台原话」/「本服务解析结果」/
+> 「拿不到」三类）与 `search_request.no_relevance_filters` 明示。端点数（9）与错误码数（12）不变。
+> 防漂移机制本身未变，下述测试仍在（`tests/test_help.py`）。
 
 **防漂移设计**（这是本端点的主要工程价值，否则 help 会变成一份会撒谎的文档）：
 
@@ -275,10 +489,18 @@ $ .venv/bin/python -m pytest -q tests/test_help.py
 
 ## 统计：**pass**
 
+> ⚠️ **本节描述的规则分类器与 IQR 异常值围栏已于 2026-09-22 移除**，以下为历史实施记录，
+> 保留原始测量数据以供追溯。当前口径为**零筛选的纯算术**：`tests/test_classify.py` 已删除，
+> IQR 下界围栏已删除，`excluded_by_reason` / `eligible` / `review` / `item_kind` 三口径对照
+> 均已不存在于 API 中。分位数算法（inclusive 线性插值、全程 Decimal、ROUND_HALF_UP）
+> 与 `insufficient_sample` 阈值（8）**未变**。见文首改造章节。
+
 ```
 $ .venv/bin/python -m pytest -q tests/test_stats.py tests/test_classify.py
 89 passed
 ```
+
+（改造后 `tests/test_classify.py` 已删除，`tests/test_stats.py` 单独重跑：**23 passed**，2026-09-22。）
 
 - 分位数固定为 **inclusive 线性插值**（等价 `statistics.quantiles(n=4, method='inclusive')`），
   但**全程 Decimal 实现**，期望值由手工推导并硬编码在测试里，不用实现自身算期望值。
@@ -305,7 +527,19 @@ $ .venv/bin/python -m pytest -q tests/test_stats.py tests/test_classify.py
 `wanted_to_buy 6`、`model_mismatch 3`、`accessory_only 2`、`item_kind_mismatch 2`
 （总和 56 > `excluded_count` 33，因一个商品可同时命中多个原因）。
 
+> ⚠️ 上表与上段已整体失效：`item_kind` 三口径（`any`/`body`/`kit`）、`eligible`/`excluded`/`review`
+> 分层、`excluded_by_reason` 分组、`sample_quality` 里的 `mixed_item_kinds` 均已从代码与 API 中删除。
+> 同一个 run（`b1ad3465…`）用现版本代码重算的结果是：`priced_count=60`、未筛选中位数 **¥4745.00**、
+> `min ¥40.00` / `max ¥8848.00`、`sample_quality=["unfiltered","guest_auth"]` ——
+> ¥40 那几条正是本表当年要排除的日租盘。数字保留，结论作废。
+
 ### ⚠️ 真实数据暴露并修复的三类误判（本项目最重要的诚实发现）
+
+> ⚠️ **本节描述的规则分类器已于 2026-09-22 移除**，以下为历史实施记录，
+> 保留原始测量数据以供追溯。`tests/test_classify.py` 已随之删除（含下文提到的
+> `test_conflicting_body_and_kit_prices_still_go_to_review`）。
+> 这三类误判本身就是「词表规则不可靠」的证据链的一部分：修完相机品类的三个坑之后，
+> 换到显示器品类仍然全军覆没（见文首新旧对比表），最终结论是**这一层不该由服务端做**。
 
 第一版规则用**裸子串匹配**，在真实 60 条数据上误删了正常整机。离线用库中真实标题复核后定位并修复，
 每一条都以真实标题原文钉成回归测试（`tests/test_classify.py`）：
@@ -321,6 +555,14 @@ $ .venv/bin/python -m pytest -q tests/test_stats.py tests/test_classify.py
 已用 `test_conflicting_body_and_kit_prices_still_go_to_review` 锁定该行为。
 
 ### 指南 9 个标签之外新增的 4 个（均有实测依据）
+
+> ⚠️ **标签体系已于 2026-09-22 整体移除**，以下为历史实施记录。
+> 其中 `auction` / `promoted_ad` 两条的**事实依据仍然有效并已保留**：
+> `exContent.isAuction` / `isAliMaMaAD` 现以 `signals.is_auction` / `signals.is_ad` 原样透出，
+> 并在 `/v1/stats` 里汇总为 `auction_count` / `ad_count` 与
+> `includes_auction_start_prices` / `includes_promoted_ads` 质量标记 ——
+> 但它们是**事实标记，不再是排除依据**。`rental_or_lease` / `model_mismatch`
+> 这两条纯词表规则已彻底删除（后者正是把「证据缺失当成证据存在」的元凶）。
 
 | 新标签 | 实测依据 |
 |---|---|
@@ -477,6 +719,7 @@ f4e217f docs: 记录 Gate A 实测证据与设计决策，钉死上游 commit
 | 上游许可始终未确认 | 无法合法分发/商用 | 保持不 vendor、仅本机使用；需要时改用 MIT 备选或取得授权 |
 | 上游 `mtop.search` 无版本承诺，平台接口随时可能变 | 采集中断 | 每轮落库 `adapter_version` + `source_commit`；`-m live` 里有字段路径哨兵测试；漂移时报 `UPSTREAM_CHANGED` |
 | 上游仓库活跃（最近推送 2026-09-18），函数签名可能变 | import 失败 | `scripts/setup.sh` 会比对 commit 与已验证值并在不一致时告警，要求重跑 `verify_upstream.py` |
-| 分类规则基于关键词启发式，换品类可能失准 | 误删/漏删 | 规则全部可解释、可追溯（`flags` + `exclusion_reasons` 逐条落库）；不确定样本进 review 而非删除；换关键词后应人工抽样复核 |
+| ~~分类规则基于关键词启发式，换品类可能失准~~ **已发生** | 非相机品类样本被大面积误删 | 2026-09-22 用历史真实库核算，确认「27寸4K显示器 电竞」90 条→0 条、「xs10相机」59 条→0 条（全部 `model_mismatch`）。已通过**整体移除该分类层**解决：改为原样透传平台字段，判断交给调用方（见文首改造章节） |
+| 服务端不再筛选，未筛选分布可能被人当行情 | 结论被误用 | `sample_quality` 恒含 `unfiltered`；`/help` 的 `must_report` 强制要求转述「样本未筛选」；已移除的筛选参数一律 422，不静默忽略 |
 | 平台风控策略变化 | 采集中断 | 出现 `CHALLENGE_REQUIRED`/`RATE_LIMITED` 立即停止，不重试硬撞；不换号换 IP |
 | 挂牌价 ≠ 成交价 | 结论被误用 | API 与 README 反复标注口径；`sample_quality` 强制暴露样本限制 |

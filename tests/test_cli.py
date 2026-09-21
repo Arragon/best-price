@@ -25,12 +25,12 @@ RUN_OK = {
     "pages_fetched": 2,
     "raw_count": 60,
     "distinct_count": 60,
-    "eligible_count": 12,
+    "priced_count": 57,
     "started_at": "2026-09-22T03:00:00Z",
     "ended_at": "2026-09-22T03:00:06Z",
     "warnings": [],
     "error": None,
-    "adapter_version": "xps-xianyu/0.1.0",
+    "adapter_version": "xps-xianyu/0.2.0",
     "source_commit": "eb52bd4d1901eee9ba8035e860583cddf50ead4c",
 }
 
@@ -38,32 +38,45 @@ STATS_OK = {
     "run_id": RUN_ID,
     "keyword": "富士 X-T4",
     "run_status": "succeeded",
-    "item_kind": "body",
     "currency": "CNY",
     "partial": False,
     "auth_mode": "guest",
     "raw_count": 60,
     "distinct_count": 60,
-    "eligible_count": 12,
-    "excluded_count": 33,
-    "excluded_by_reason": {"rental_or_lease": 22, "accessory_only": 2, "wanted_to_buy": 6},
-    "needs_review_count": 15,
-    "suspicious_price_count": 0,
-    "min_yuan": "4390.00",
-    "p25_yuan": "4772.50",
+    "priced_count": 57,
+    "unpriced_count": 3,
+    "unpriced_by_status": {"ambiguous": 2, "missing": 1},
+    "auction_count": 1,
+    "ad_count": 2,
+    "min_yuan": "50.00",
+    "p25_yuan": "4390.00",
     "median_yuan": "5249.50",
     "p75_yuan": "5349.25",
     "max_yuan": "7500.00",
     "lowest_items": [
         {
+            "product_id": 61,
+            "title": "合成 X-T4 电池",
+            "canonical_url": "https://www.goofish.com/item?id=1086862848999",
+            "price_yuan": "50.00",
+        }
+    ],
+    "highest_items": [
+        {
             "product_id": 58,
             "title": "合成 富士X-T4微单机身 黑色",
             "canonical_url": "https://www.goofish.com/item?id=1086862848607",
-            "price_yuan": "4390.00",
+            "price_yuan": "7500.00",
         }
     ],
     "insufficient_sample": False,
-    "sample_quality": ["guest_auth"],
+    "sample_quality": [
+        "unfiltered",
+        "includes_auction_start_prices",
+        "includes_promoted_ads",
+        "some_prices_unparsed",
+        "guest_auth",
+    ],
     "started_at": "2026-09-22T03:00:00Z",
     "ended_at": "2026-09-22T03:00:06Z",
 }
@@ -72,26 +85,47 @@ PRODUCTS_OK = {
     "run_id": RUN_ID,
     "run_status": "succeeded",
     "partial": False,
-    "total": 12,
+    "total": 57,
     "limit": 5,
     "offset": 0,
     "items": [
         {
             "product_id": 58,
-            "title": "合成 富士X-T4微单机身 黑色",
-            "canonical_url": "https://www.goofish.com/item?id=1086862848607",
-            "price_text": "¥4390",
-            "price_yuan": "4390.00",
-            "observed_at": "2026-09-22T03:00:05Z",
-            "published_at": "2026-09-21T11:13:52Z",
-            "area": "上海",
-            "flags": ["exact_model"],
-            "item_kind": "body",
-            "excluded": False,
-            "exclusion_reasons": [],
-            "needs_review": False,
-            "price_parse_status": "valid",
             "source_run_id": RUN_ID,
+            "observed_at": "2026-09-22T03:00:05Z",
+            "canonical_url": "https://www.goofish.com/item?id=1086862848607",
+            "title": "合成 富士X-T4微单机身 黑色",
+            "description": "合成 富士X-T4微单机身 黑色\n无拆无修\n配件：电池2块",
+            "price": {
+                "raw": "¥4390",
+                "yuan": "4390.00",
+                "fen": 439_000,
+                "parse_status": "valid",
+                "original_text": "¥6999",
+                "coupon_text": "券已抵50元",
+            },
+            "seller": {
+                "display_name": "合成卖家",
+                "credit": "卖家信用极好",
+                "review_count": 318,
+                "positive_rate": "39%",
+                "identity": "闲鱼严选卖家",
+                "avatar_url": "https://img.example.invalid/synthetic-avatar.jpg",
+            },
+            "area": "上海",
+            "media": {
+                "image_url": "https://img.example.invalid/synthetic.jpg",
+                "has_video": False,
+            },
+            "published_at": "2026-09-21T11:13:52Z",
+            "signals": {
+                "published_text": "6小时前发布",
+                "want_count": 8,
+                "free_shipping": True,
+                "labels": ["验货宝"],
+                "is_auction": False,
+                "is_ad": False,
+            },
         }
     ],
 }
@@ -128,31 +162,54 @@ def test_report_shows_sample_size_next_to_the_median() -> None:
     text = report()
 
     assert "5249.50" in text
-    assert "12" in text
+    assert "57" in text
     assert "样本" in text
 
 
 def test_report_shows_the_full_five_number_summary() -> None:
     text = report()
 
-    for value in ("4390.00", "4772.50", "5249.50", "5349.25", "7500.00"):
+    for value in ("50.00", "4390.00", "5249.50", "5349.25", "7500.00"):
         assert value in text
 
 
-def test_report_lists_exclusion_reasons_with_counts() -> None:
-    """用户必须知道 60 条里有 33 条被排除、以及为什么。"""
+def test_report_declares_the_sample_is_unfiltered() -> None:
+    """最重要的一条：这份分布没有清洗过。少了这句，用户会把含租赁盘的中位数当行情。"""
     text = report()
 
-    assert "rental_or_lease" in text
-    assert "22" in text
-    assert "33" in text
+    assert "未筛选" in text
+    assert "unfiltered" in text
 
 
-def test_report_shows_needs_review_count() -> None:
+def test_report_lists_unpriced_breakdown_instead_of_exclusions() -> None:
+    """「面议」「平台没给价格」不是被排除，是没进算术——必须说清楚是哪一种。"""
     text = report()
 
-    assert "15" in text
-    assert "待核验" in text or "review" in text.lower()
+    assert "无价 3" in text
+    assert "ambiguous 2" in text
+    assert "missing 1" in text
+
+
+def test_report_counts_auction_and_ad_items() -> None:
+    """拍卖起拍价与广告位仍在样本里，但条数必须露出来。"""
+    text = report()
+
+    assert "拍卖 1" in text
+    assert "广告位 2" in text
+
+
+def test_report_shows_seller_credit_next_to_the_price() -> None:
+    """判断一条报价可不可信，卖家信用与好评率是最直接的依据。"""
+    text = report()
+
+    assert "卖家信用极好" in text
+    assert "好评率39%(318评价)" in text
+    assert "闲鱼严选卖家" in text
+
+
+def test_report_flags_coupon_when_it_qualifies_the_price() -> None:
+    """「券已抵50元」意味着展示价可能已扣券，属价格口径。"""
+    assert "券已抵50元" in report()
 
 
 def test_report_lists_sample_quality_verbatim() -> None:
@@ -180,7 +237,7 @@ def test_report_includes_provenance() -> None:
 
 
 def test_insufficient_sample_produces_a_prominent_warning() -> None:
-    thin = {**STATS_OK, "eligible_count": 3, "insufficient_sample": True,
+    thin = {**STATS_OK, "priced_count": 3, "insufficient_sample": True,
             "sample_quality": ["insufficient_sample", "guest_auth"]}
 
     text = report(stats=thin)
@@ -191,7 +248,7 @@ def test_insufficient_sample_produces_a_prominent_warning() -> None:
 
 def test_insufficient_sample_never_presents_a_fair_market_price() -> None:
     """§7：样本过少时不得产出过度确定的「市场公允价」。"""
-    thin = {**STATS_OK, "eligible_count": 3, "insufficient_sample": True,
+    thin = {**STATS_OK, "priced_count": 3, "insufficient_sample": True,
             "sample_quality": ["insufficient_sample"]}
 
     text = report(stats=thin)
@@ -215,23 +272,28 @@ def test_partial_run_is_flagged() -> None:
     assert "部分" in text
 
 
-def test_zero_eligible_samples_explains_why_instead_of_showing_a_median() -> None:
+def test_zero_priced_samples_explains_why_instead_of_showing_a_median() -> None:
+    """一条价格都解析不出来时，必须说清楚是哪种情况，不能显示一个空的中位数。"""
     empty = {
         **STATS_OK,
-        "eligible_count": 0,
+        "priced_count": 0,
+        "unpriced_count": 12,
+        "unpriced_by_status": {"ambiguous": 9, "missing": 3},
         "min_yuan": None,
         "p25_yuan": None,
         "median_yuan": None,
         "p75_yuan": None,
         "max_yuan": None,
         "lowest_items": [],
+        "highest_items": [],
         "insufficient_sample": True,
     }
 
-    text = report(stats=empty)
+    text = report(stats=empty, products=[])
 
-    assert "中位数" not in text or "无" in text
-    assert "rental_or_lease" in text, "必须指出样本被什么排除光了"
+    assert "有价样本 0 件" in text
+    assert "ambiguous 9" in text, "必须指出价格为什么进不了算术"
+    assert "missing 3" in text
 
 
 # ---------------------------------------------------------------- 失败分诊
@@ -344,7 +406,7 @@ def test_query_happy_path_returns_report_and_exit_zero() -> None:
         return httpx.Response(404, json={"code": "INVALID_QUERY", "message": "?"})
 
     with make_client(handler) as client:
-        result = query(client, keyword="富士 X-T4", item_kind="body", poll_interval=0)
+        result = query(client, keyword="富士 X-T4", poll_interval=0)
 
     assert isinstance(result, QueryResult)
     assert result.exit_code == 0

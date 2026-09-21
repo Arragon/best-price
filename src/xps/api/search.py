@@ -52,7 +52,6 @@ async def submit_search(
             min_price=payload.min_price_yuan,
             max_price=payload.max_price_yuan,
             city=payload.city,
-            item_kind=payload.item_kind,
         )
     )
     return SearchAccepted(
@@ -80,7 +79,7 @@ async def get_search_run(
         pages_fetched=run.pages_fetched,
         raw_count=run.raw_count,
         distinct_count=repo.count_observations_for_run(run_id),
-        eligible_count=run.eligible_count,
+        priced_count=run.priced_count,
         started_at=run.started_at,
         ended_at=run.ended_at,
         warnings=list(run.warnings),

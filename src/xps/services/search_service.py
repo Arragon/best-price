@@ -17,7 +17,6 @@ from typing import Any
 from xps.adapters.base import CrawlResult
 from xps.adapters.xianyu import ADAPTER_VERSION
 from xps.errors import RUN_INTERRUPTED, ServiceError
-from xps.services.classify import ANY, build_model_spec
 from xps.services.normalize import normalize_listing
 from xps.services.statistics import compute_stats
 from xps.settings import Settings
@@ -36,7 +35,6 @@ class SearchRequest:
     min_price: Decimal | None = None
     max_price: Decimal | None = None
     city: str | None = None
-    item_kind: str = ANY
 
     def filters_dict(self) -> dict[str, Any]:
         return {
@@ -44,8 +42,6 @@ class SearchRequest:
             "min_price_yuan": str(self.min_price) if self.min_price is not None else None,
             "max_price_yuan": str(self.max_price) if self.max_price is not None else None,
             "city": self.city,
-            # 本地后置过滤，不是平台过滤；统计端据此筛样本
-            "item_kind": self.item_kind,
         }
 
 
@@ -124,7 +120,7 @@ class SearchService:
                 )
                 return
 
-            self._persist(run_id, request, result)
+            self._persist(run_id, result)
 
     def _fail(
         self,
@@ -144,12 +140,12 @@ class SearchService:
             error_message=message,
         )
 
-    def _persist(self, run_id: str, request: SearchRequest, result: CrawlResult) -> None:
-        spec = build_model_spec(request.keyword)
+    def _persist(self, run_id: str, result: CrawlResult) -> None:
         warnings = list(result.warnings)
         raw_count = 0
         stored_count = 0
         skipped = 0
+        untrusted = 0
 
         for outcome in result.pages:
             if not outcome.fetched:
@@ -159,17 +155,20 @@ class SearchService:
             observed_at = datetime.now(timezone.utc)
             raw_count += len(outcome.listings)
             normalized = [
-                normalize_listing(raw, spec=spec, observed_at=observed_at)
-                for raw in outcome.listings
+                normalize_listing(raw, observed_at=observed_at) for raw in outcome.listings
             ]
             summary = self.repo.store_listings(
                 run_id, normalized, page_number=outcome.page
             )
             stored_count += summary.stored
             skipped += summary.skipped_unidentifiable
+            untrusted += summary.untrusted_identity
 
         if skipped:
             warnings.append(f"skipped_unidentifiable:{skipped}")
+        if untrusted:
+            # 这些条目已入库，但主机不在实测确认的白名单里，canonical_url 为 None
+            warnings.append(f"untrusted_identity:{untrusted}")
 
         failed_pages = [page for page in result.pages if not page.fetched]
         pages_fetched = result.pages_fetched
@@ -182,7 +181,7 @@ class SearchService:
                 pages_fetched=0,
                 raw_count=0,
                 stored_count=0,
-                eligible_count=0,
+                priced_count=0,
                 auth_mode=result.auth_mode,
                 error_code=(first.error_code if first else None) or "UPSTREAM_UNAVAILABLE",
                 error_message=(first.error_message if first else None)
@@ -198,7 +197,6 @@ class SearchService:
             run_id=run_id,
             items=self.repo.stats_items(run_id),
             raw_count=raw_count,
-            item_kind=request.item_kind,
             min_sample=self.settings.min_sample_threshold,
             pages_requested=result.pages_requested,
             pages_fetched=pages_fetched,
@@ -212,7 +210,7 @@ class SearchService:
             pages_fetched=pages_fetched,
             raw_count=raw_count,
             stored_count=stored_count,
-            eligible_count=stats.eligible_count,
+            priced_count=stats.priced_count,
             auth_mode=result.auth_mode,
             error_code=first_error.error_code if first_error else None,
             error_message=first_error.error_message if first_error else None,

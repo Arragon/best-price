@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # 真实低频烟测：走完 §8.7 的完整 Agent 调用链路。
 #
-#   scripts/smoke-local.sh "富士 X-T4" 1 any
+#   scripts/smoke-local.sh "富士 X-T4" 1
+#   scripts/smoke-local.sh "RTX 4090" 1        # 任意品类，同一套用法
 #
 # 会对闲鱼发**真实**请求（一次，逐页串行）。请保持低频，不要循环调用。
 # 出现 CHALLENGE_REQUIRED / RATE_LIMITED 时脚本会如实报出，不会重试硬撞。
+#
+# 本服务不做相关性筛选：下面打印的是平台原样字段，判断可比性由调用方做。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -12,7 +15,6 @@ cd "$ROOT"
 
 KEYWORD="${1:-富士 X-T4}"
 MAX_PAGES="${2:-1}"
-ITEM_KIND="${3:-any}"
 BASE="${BASE_URL:-http://127.0.0.1:8765}"
 TIMEOUT="${POLL_TIMEOUT:-180}"
 PY=".venv/bin/python"
@@ -42,10 +44,10 @@ AUTH="$(curl -fsS "$BASE/v1/auth/status")"
 echo "auth/status : $AUTH"
 
 PAYLOAD="$(
-  "$PY" - "$KEYWORD" "$MAX_PAGES" "$ITEM_KIND" <<'PY'
+  "$PY" - "$KEYWORD" "$MAX_PAGES" <<'PY'
 import json, sys
 print(json.dumps(
-    {"keyword": sys.argv[1], "max_pages": int(sys.argv[2]), "sort": "newest", "item_kind": sys.argv[3]},
+    {"keyword": sys.argv[1], "max_pages": int(sys.argv[2]), "sort": "newest"},
     ensure_ascii=False,
 ))
 PY
@@ -90,24 +92,41 @@ if [ "$STATUS" = "failed" ] || [ "$STATUS" = "blocked_login" ]; then
 fi
 
 echo
-echo "== GET /v1/products?run_id=$RUN_ID （按价格升序，前 8 条）=="
+echo "== GET /v1/products?run_id=$RUN_ID （按价格升序，前 8 条；平台字段原样透出）=="
 curl -fsS "$BASE/v1/products?run_id=$RUN_ID&limit=8" | "$PY" -c "
 import json, sys
 body = json.load(sys.stdin)
 print('total=%s  run_status=%s  partial=%s' % (body['total'], body['run_status'], body['partial']))
 for item in body['items']:
-    price = ('¥' + item['price_yuan']) if item['price_yuan'] else '(无有效价格)'
+    price = item['price']
+    shown = ('¥' + price['yuan']) if price['yuan'] else '(无有效价格: %s)' % price['parse_status']
     title = (item['title'] or '(无标题)').replace(chr(10), ' ')[:46]
-    state = '排除' if item['excluded'] else ('待核验' if item['needs_review'] else '合格')
-    reason = ','.join(item['exclusion_reasons']) or ','.join(item['flags']) or '-'
-    print('  %-12s %-6s %s' % (price, state, title))
-    print('               %s' % item['canonical_url'])
-    print('               理由: %s' % reason)
+    seller = item['seller']
+    who = ' · '.join(x for x in (
+        seller.get('display_name'), item.get('area'), seller.get('credit'),
+        ('好评率%s(%s评价)' % (seller['positive_rate'], seller['review_count']))
+        if seller.get('positive_rate') is not None and seller.get('review_count') is not None else None,
+    ) if x)
+    marks = []
+    sig = item['signals']
+    if sig.get('is_auction'): marks.append('拍卖')
+    if sig.get('is_ad'): marks.append('广告位')
+    if price.get('coupon_text'): marks.append(price['coupon_text'])
+    if sig.get('want_count') is not None: marks.append('%s人想要' % sig['want_count'])
+    if sig.get('free_shipping'): marks.append('包邮')
+    print('  %-14s %s' % (shown, title))
+    print('                 %s' % (who or '(卖家信息缺失)'))
+    if marks: print('                 标记: %s' % ' · '.join(marks))
+    desc = (item.get('description') or '').replace(chr(10), ' ')[:60]
+    if desc: print('                 描述: %s' % desc)
+    print('                 %s' % item['canonical_url'])
 "
 
 echo
-echo "== GET /v1/stats?run_id=$RUN_ID&item_kind=$ITEM_KIND =="
-curl -fsS "$BASE/v1/stats?run_id=$RUN_ID&item_kind=$ITEM_KIND" | "$PY" -m json.tool
+echo "== GET /v1/stats?run_id=$RUN_ID （未筛选的算术分布）=="
+curl -fsS "$BASE/v1/stats?run_id=$RUN_ID" | "$PY" -m json.tool
 
 echo
 echo "✓ 烟测结束。以上为**采集时刻的公开在售报价**，不是成交价。"
+echo "  样本**未筛选**：租赁盘、拍卖起拍价、配件、故障机、广告位都在分布里，"
+echo "  请读上面的描述与卖家信息自行判断可比性。"

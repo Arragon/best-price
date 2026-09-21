@@ -1,6 +1,16 @@
-"""价格原文 → 人民币分。
+"""平台条目 → 可入库形态：身份去重 + 价格解析，**不做相关性判断**。
 
-口径：采集时刻的**公开在售报价**。不是成交价，不含国补/优惠券/议价结果。
+本服务只负责采集与清洗，不替调用方决定哪条商品「可比」。
+分类筛选层已移除：它靠词表猜品类，换个品类就大面积误杀有效样本，
+而这些判断调用方（agent）拿着原始字段自己做要准得多。
+
+保留的两件事都不是筛选：
+- `resolve_identity`：跨轮去重要靠稳定身份键，否则同一件商品会被重复计入
+- `parse_price`：把「¥5642.50」「面议」「¥90/天」变成机器可读形态。
+  解析不出来时**保留原文**并标注状态，条目照样返回给调用方，不删除。
+
+价格口径：采集时刻的**公开在售报价**。不是成交价，不含国补/优惠券/议价结果。
+若平台标了券抵扣（`coupon_text`），展示价可能已扣券——原文一并透出，由调用方判断。
 
 全程 Decimal，绝不出现 float：
     float(1.15) * 10000      == 11499.999999999998   → 少一分
@@ -13,19 +23,10 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
-from typing import TYPE_CHECKING
 
-from xps.services.classify import (
-    INVALID_IDENTITY as INVALID_IDENTITY_FLAG,
-    Classification,
-    ModelSpec,
-    classify,
-)
+from xps.adapters.base import RawListing
 from xps.services.identity import INVALID_IDENTITY as INVALID_ID_SOURCE
 from xps.services.identity import Identity, resolve_identity
-
-if TYPE_CHECKING:  # 仅注解用：避免 service 层在运行时反向依赖 adapter 层
-    from xps.adapters.base import RawListing
 
 VALID = "valid"
 AMBIGUOUS = "ambiguous"
@@ -125,65 +126,23 @@ def parse_price(text: str | None) -> PriceParse:
 
 @dataclass(frozen=True)
 class NormalizedListing:
-    """RawListing 经身份/价格/相关性处理后的可入库形态。"""
+    """平台原样字段 + 身份 + 价格解析结果。不携带任何相关性判断。"""
 
+    raw: RawListing
     identity: Identity
-    title: str | None
-    price_raw: str | None
-    price_fen: int | None
-    price_status: str
-    currency: str | None
-    area: str | None
-    seller_display_name: str | None
-    image_url: str | None
-    published_at: str | None
+    price: PriceParse
     observed_at: datetime
-    classification: Classification
-    raw_payload: dict | None
-    # 既无平台 ID 又无可信 URL 的条目无法安全去重，不硬塞进 products
+    # 既无平台 ID 又无可信 URL 的条目无法安全去重（identity_key 会碰撞成一行，
+    # 静默吞掉数据），故不入库，只计数上报。这是数据完整性约束，不是相关性筛选。
     storable: bool
 
 
-def normalize_listing(
-    raw: RawListing,
-    *,
-    spec: ModelSpec,
-    observed_at: datetime,
-) -> NormalizedListing:
+def normalize_listing(raw: RawListing, *, observed_at: datetime) -> NormalizedListing:
     identity = resolve_identity(raw.source_id, raw.url)
-    price = parse_price(raw.price_text)
-    classification = classify(
-        raw.title or "",
-        spec=spec,
-        is_auction=raw.is_auction,
-        is_ad=raw.is_ad,
-    )
-
-    if identity.id_source == INVALID_ID_SOURCE and INVALID_IDENTITY_FLAG not in classification.flags:
-        # 身份不可信 → 不进可信统计（指南 §7），但仍保留记录以便追溯
-        classification = Classification(
-            flags=classification.flags + (INVALID_IDENTITY_FLAG,),
-            item_kind=classification.item_kind,
-            excluded=True,
-            exclusion_reasons=tuple(
-                sorted(set(classification.exclusion_reasons) | {INVALID_IDENTITY_FLAG})
-            ),
-            needs_review=False,
-        )
-
     return NormalizedListing(
+        raw=raw,
         identity=identity,
-        title=raw.title,
-        price_raw=price.price_raw,
-        price_fen=price.price_fen,
-        price_status=price.status,
-        currency=price.currency,
-        area=raw.area,
-        seller_display_name=raw.seller_name,
-        image_url=raw.image_url,
-        published_at=raw.published_at,
+        price=parse_price(raw.price_text),
         observed_at=observed_at,
-        classification=classification,
-        raw_payload=raw.raw_payload,
         storable=identity.id_source != INVALID_ID_SOURCE or bool((raw.url or "").strip()),
     )

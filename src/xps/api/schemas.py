@@ -10,7 +10,6 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-ItemKind = Literal["body", "kit", "any"]
 SortOption = Literal["newest", "price_asc", "price_desc", "default"]
 
 KEYWORD_MAX_LENGTH = 64
@@ -31,7 +30,6 @@ class SearchSubmitRequest(BaseModel):
     sort: SortOption = "newest"
     min_price_yuan: Decimal | None = Field(default=None, ge=0)
     max_price_yuan: Decimal | None = Field(default=None, ge=0)
-    item_kind: ItemKind = "any"
 
     # 上游 SearchFilters 支持这三项，但平台是否真过滤**未经实测验证**，
     # 故声明出来只为给出明确的 UNSUPPORTED_FILTER，而不是静默忽略。
@@ -84,7 +82,8 @@ class SearchRunResponse(BaseModel):
     pages_fetched: int
     raw_count: int
     distinct_count: int
-    eligible_count: int
+    # 去重后价格可解析的条目数。不叫 eligible：本服务不做合格性筛选。
+    priced_count: int
     started_at: str
     ended_at: str | None
     warnings: list[str]
@@ -94,24 +93,75 @@ class SearchRunResponse(BaseModel):
     source_commit: str | None = None
 
 
-class ProductItem(BaseModel):
-    product_id: int
-    title: str | None
-    canonical_url: str | None
-    price_text: str | None
-    price_yuan: str | None
-    observed_at: str
-    published_at: str | None
-    area: str | None
-    seller_display_name: str | None
+class SellerInfo(BaseModel):
+    """卖家侧的平台自报信息。缺失即 null，不做任何推断或补齐。"""
+
+    display_name: str | None
+    # 平台信用标签原文，实测取值「卖家信用极好」「卖家信用优秀」（60 条中 56 条给出）
+    credit: str | None
+    review_count: int | None
+    # 「好评率39%」→「39%」
+    positive_rate: str | None
+    # 平台身份标识原文，如「闲鱼严选卖家」
+    identity: str | None
+    avatar_url: str | None
+
+
+class PriceInfo(BaseModel):
+    """采集时刻的公开在售报价。不是成交价，不含国补 / 优惠券 / 议价结果。"""
+
+    # 平台价格控件原文，如「¥5642.50」「面议」「¥90」
+    raw: str | None
+    yuan: str | None
+    fen: int | None
+    # valid / ambiguous（面议、区间、租金等）/ missing（平台没给）/ invalid（给了但解析不了）
+    parse_status: str
+    # 划线原价原文；实测仅少数条目给出
+    original_text: str | None
+    # 平台券标签原文，如「券已抵50元」。展示价可能已扣券，属价格口径的一部分。
+    coupon_text: str | None
+
+
+class MediaInfo(BaseModel):
+    # 搜索响应每个商品只给 1 张主图。多图需商品详情接口，实测 guest 调用
+    # mtop.taobao.idle.pc.detail 返回 RGV587 风控挑战，故只有单图。
     image_url: str | None
-    flags: list[str]
-    item_kind: str | None
-    excluded: bool
-    exclusion_reasons: list[str]
-    needs_review: bool
-    price_parse_status: str
+    has_video: bool
+
+
+class ListingSignals(BaseModel):
+    """平台事实标记。**不是**本服务的排除依据——要不要采信由调用方判断。"""
+
+    # 平台自报的相对时间原文，如「8小时前发布」
+    published_text: str | None
+    want_count: int | None
+    free_shipping: bool
+    # 徽标原文，实测取值「严选」「验货宝」
+    labels: list[str]
+    # 起拍价不是普通在售报价
+    is_auction: bool
+    # 广告位不是自然搜索结果
+    is_ad: bool
+
+
+class ProductItem(BaseModel):
+    """一件商品的清洗后快照：平台真实给出的字段原样透出，附加本服务的解析结果。"""
+
+    product_id: int
     source_run_id: str
+    observed_at: str
+    # 已剥除跟踪参数的可打开链接
+    canonical_url: str | None
+    # 搜索页展示的单行标题（实测平台从不在这里放换行）
+    title: str | None
+    # 同一篇挂牌文字，但保留换行分段，最长约 1500 字。判断是不是租赁/配件/求购看这个。
+    description: str | None
+    price: PriceInfo
+    seller: SellerInfo
+    area: str | None
+    media: MediaInfo
+    published_at: str | None
+    signals: ListingSignals
 
 
 class ProductPage(BaseModel):
@@ -124,7 +174,7 @@ class ProductPage(BaseModel):
     offset: int
 
 
-class LowestItem(BaseModel):
+class PricedItem(BaseModel):
     product_id: int
     title: str
     canonical_url: str | None
@@ -132,21 +182,28 @@ class LowestItem(BaseModel):
 
 
 class StatsResponse(BaseModel):
+    """**未筛选**的算术结果：租赁盘、拍卖起拍价、配件、广告位全都在样本里。
+
+    要看构成就配 /v1/products 一起读；sample_quality 里恒含 `unfiltered`，
+    转述时不得省略。
+    """
+
     run_id: str
     keyword: str
     run_status: str
-    item_kind: str
     currency: str
     partial: bool
     auth_mode: str | None
 
     raw_count: int
     distinct_count: int
-    eligible_count: int
-    excluded_count: int
-    excluded_by_reason: dict[str, int]
-    needs_review_count: int
-    suspicious_price_count: int
+    # 参与算术的条目数（去重后 price_parse_status=valid）
+    priced_count: int
+    # 未参与算术的条目数，按解析状态分组；这些条目仍可从 /v1/products 取到原文
+    unpriced_count: int
+    unpriced_by_status: dict[str, int]
+    auction_count: int
+    ad_count: int
 
     min_yuan: str | None
     p25_yuan: str | None
@@ -159,7 +216,8 @@ class StatsResponse(BaseModel):
     p75_fen: int | None
     max_fen: int | None
 
-    lowest_items: list[LowestItem]
+    lowest_items: list[PricedItem]
+    highest_items: list[PricedItem]
     insufficient_sample: bool
     sample_quality: list[str]
     started_at: str

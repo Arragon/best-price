@@ -39,7 +39,7 @@ def test_completed_run_reports_layered_counts(client) -> None:
     assert run["pages_fetched"] == 1
     assert run["raw_count"] == 8
     assert run["distinct_count"] == 8
-    assert run["eligible_count"] == 8
+    assert run["priced_count"] == 8
     assert run["error"] is None
     assert run["started_at"] and run["ended_at"]
 
@@ -64,11 +64,18 @@ def test_price_filters_are_passed_as_decimal(client, adapter) -> None:
     assert adapter.calls[0]["max_price"] == Decimal("6500.50")
 
 
-def test_item_kind_is_forwarded_to_stats_not_to_the_platform(client, adapter) -> None:
-    """item_kind 是本地后置过滤，不能暗称已由平台过滤（§8.1）。"""
-    search_and_wait(client, {"keyword": "富士 X-T4", "item_kind": "body"})
+def test_relevance_filters_are_not_accepted_at_all(client, adapter) -> None:
+    """本服务不做相关性筛选，所以不接受任何相关性参数。
 
-    assert "item_kind" not in adapter.calls[0]
+    历史上这里有 item_kind（单机身/套机）。它靠相机词表判断，换个品类就把
+    全部商品推去 review、样本归零。参数已移除：宁可 422 明确拒绝，
+    也不要收下一个会被静默忽略、让调用方以为已过滤的参数。
+    """
+    response = submit(client, {"keyword": "富士 X-T4", "item_kind": "body"})
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "INVALID_QUERY"
+    assert adapter.calls == [], "被拒的请求不得触发对平台的真实搜索"
 
 
 def test_unknown_run_returns_404(client) -> None:
@@ -146,14 +153,15 @@ def test_product_item_exposes_every_required_field(client) -> None:
     for field in (
         "product_id",
         "title",
+        "description",
         "canonical_url",
-        "price_text",
-        "price_yuan",
-        "observed_at",
-        "published_at",
+        "price",
+        "seller",
         "area",
-        "flags",
-        "exclusion_reasons",
+        "media",
+        "signals",
+        "published_at",
+        "observed_at",
         "source_run_id",
     ):
         assert field in item
@@ -163,19 +171,94 @@ def test_product_item_exposes_every_required_field(client) -> None:
         assert tracking not in item["canonical_url"]
 
 
+def test_product_item_passes_platform_fields_through_verbatim(tmp_path) -> None:
+    """这是本端点存在的理由：平台给出的判断依据必须完整到达调用方。
+
+    少透一个字段，agent 就少一份判断「这条报价可不可比」的依据。
+    """
+    adapter = FakeAdapter(
+        pages=[
+            [
+                synthetic_listing(
+                    "7001",
+                    title="合成 X-T4 单机身",
+                    description="合成 X-T4 单机身\n无拆无修\n配件：电池2块",
+                    credit="卖家信用极好",
+                    review_count=318,
+                    positive_rate="39%",
+                    seller_identity="闲鱼严选卖家",
+                    published_text="6小时前发布",
+                    want_count=8,
+                    coupon_text="券已抵50元",
+                    free_shipping=True,
+                    badges=("验货宝",),
+                    ori_price="¥6999",
+                    has_video=True,
+                    is_auction=True,
+                    is_ad=True,
+                )
+            ]
+        ]
+    )
+    with build_client(tmp_path, adapter) as test_client:
+        run = search_and_wait(test_client)
+        item = test_client.get(f"/v1/products?run_id={run['run_id']}").json()["items"][0]
+
+    assert item["description"] == "合成 X-T4 单机身\n无拆无修\n配件：电池2块"
+    assert item["seller"] == {
+        "display_name": "合成卖家",
+        "credit": "卖家信用极好",
+        "review_count": 318,
+        "positive_rate": "39%",
+        "identity": "闲鱼严选卖家",
+        "avatar_url": "https://img.example.invalid/synthetic-avatar.jpg",
+    }
+    assert item["signals"] == {
+        "published_text": "6小时前发布",
+        "want_count": 8,
+        "free_shipping": True,
+        "labels": ["验货宝"],
+        "is_auction": True,
+        "is_ad": True,
+    }
+    assert item["price"]["coupon_text"] == "券已抵50元"
+    assert item["price"]["original_text"] == "¥6999"
+    assert item["media"] == {
+        "image_url": "https://img.example.invalid/synthetic.jpg",
+        "has_video": True,
+    }
+
+
 def test_price_yuan_is_a_string_with_two_decimals(client) -> None:
     run = search_and_wait(client)
 
     item = client.get(f"/v1/products?run_id={run['run_id']}").json()["items"][0]
 
-    assert item["price_yuan"] == "4800.00"
-    assert item["price_text"] == "¥4800"
+    assert item["price"]["yuan"] == "4800.00"
+    assert item["price"]["fen"] == 480_000
+    assert item["price"]["raw"] == "¥4800"
+    assert item["price"]["parse_status"] == "valid"
 
 
 def test_missing_fields_are_null_never_placeholders(tmp_path) -> None:
     """§8.3：可见字段缺失即 null，不能插入「暂无」的占位伪数据。"""
     adapter = FakeAdapter(
-        pages=[[synthetic_listing("7777", title=None, area=None, nick=None, price_text=None)]]
+        pages=[
+            [
+                synthetic_listing(
+                    "7777",
+                    title=None,
+                    area=None,
+                    nick=None,
+                    price_text=None,
+                    credit=None,
+                    review_count=None,
+                    positive_rate=None,
+                    avatar_url=None,
+                    published_text=None,
+                )
+            ]
+        ]
     )
     with build_client(tmp_path, adapter) as test_client:
         run = search_and_wait(test_client)
@@ -183,8 +266,15 @@ def test_missing_fields_are_null_never_placeholders(tmp_path) -> None:
 
     assert item["title"] is None
     assert item["area"] is None
-    assert item["price_yuan"] is None
-    assert item["price_text"] is None
+    assert item["price"]["yuan"] is None
+    assert item["price"]["raw"] is None
+    assert item["seller"]["display_name"] is None
+    assert item["seller"]["credit"] is None
+    assert item["seller"]["review_count"] is None
+    assert item["seller"]["positive_rate"] is None
+    assert item["seller"]["avatar_url"] is None
+    assert item["signals"]["published_text"] is None
+    assert item["signals"]["want_count"] is None
     blob = str(item).lower()
     for placeholder in ("暂无", "未知", "匿名"):
         assert placeholder not in blob
@@ -202,18 +292,43 @@ def test_products_paginates_with_default_50_and_max_100(tmp_path) -> None:
     assert capped.status_code == 422
 
 
-def test_products_eligible_only_excludes_accessories(tmp_path) -> None:
+def test_products_priced_only_keeps_anything_with_a_parseable_price(tmp_path) -> None:
+    """priced_only 不是相关性筛选：¥50 的「电池」照样算有价条目。
+
+    旧实现在这里把配件判成 accessory_only 排除掉。本服务不再判断可比性，
+    要排除请调用方自己读 description 与 signals 决定。
+    """
     adapter = FakeAdapter(
         pages=[[synthetic_listing("7001"), synthetic_listing("7002", title="X-T4 电池", price_text="50")]]
     )
     with build_client(tmp_path, adapter) as test_client:
         run = search_and_wait(test_client)
         body = test_client.get(
-            f"/v1/products?run_id={run['run_id']}&eligible_only=true"
+            f"/v1/products?run_id={run['run_id']}&priced_only=true"
         ).json()
 
-    assert body["total"] == 1
-    assert body["items"][0]["title"] == "合成 富士 X-T4 单机身"
+    assert body["total"] == 2
+    assert {item["title"] for item in body["items"]} == {"合成 富士 X-T4 单机身", "X-T4 电池"}
+
+
+def test_unpriced_listings_are_still_returned_with_their_raw_text(tmp_path) -> None:
+    """「面议」解析不出数字，但条目与原文都必须还在——这是调用方的判断依据。"""
+    adapter = FakeAdapter(
+        pages=[[synthetic_listing("7001", title="合成 面议", price_text="面议")]]
+    )
+    with build_client(tmp_path, adapter) as test_client:
+        run = search_and_wait(test_client)
+        priced = test_client.get(
+            f"/v1/products?run_id={run['run_id']}&priced_only=true"
+        ).json()
+        everything = test_client.get(f"/v1/products?run_id={run['run_id']}").json()
+
+    assert priced["total"] == 0
+    assert everything["total"] == 1
+    item = everything["items"][0]
+    assert item["price"]["raw"] == "¥面议"
+    assert item["price"]["yuan"] is None
+    assert item["price"]["parse_status"] == "ambiguous"
 
 
 def test_products_requires_run_id(client) -> None:
@@ -228,8 +343,9 @@ def test_stats_reports_median_and_sample_size(client) -> None:
 
     body = client.get(f"/v1/stats?run_id={run['run_id']}").json()
 
-    # 8 件合成机身：480000..550000 分，步长 10000
-    assert body["eligible_count"] == 8
+    # 8 件合成商品：480000..550000 分，步长 10000
+    assert body["priced_count"] == 8
+    assert body["unpriced_count"] == 0
     assert body["min_yuan"] == "4800.00"
     assert body["max_yuan"] == "5500.00"
     assert body["median_yuan"] == "5150.00"
@@ -237,13 +353,25 @@ def test_stats_reports_median_and_sample_size(client) -> None:
     assert body["currency"] == "CNY"
 
 
-def test_stats_exposes_traceable_lowest_items(client) -> None:
+def test_stats_always_declares_itself_unfiltered(client) -> None:
+    """这份分布没有清洗过，任何转述都不能假装它清洗过。"""
+    run = search_and_wait(client)
+
+    body = client.get(f"/v1/stats?run_id={run['run_id']}").json()
+
+    assert "unfiltered" in body["sample_quality"]
+
+
+def test_stats_exposes_traceable_extremes(client) -> None:
     run = search_and_wait(client)
 
     body = client.get(f"/v1/stats?run_id={run['run_id']}").json()
 
     assert body["lowest_items"]
+    assert body["highest_items"]
     assert all(entry["canonical_url"] for entry in body["lowest_items"])
+    assert body["lowest_items"][0]["price_yuan"] == "4800.00"
+    assert body["highest_items"][0]["price_yuan"] == "5500.00"
 
 
 def test_stats_requires_run_id(client) -> None:
@@ -251,26 +379,37 @@ def test_stats_requires_run_id(client) -> None:
     assert client.get("/v1/stats").status_code == 422
 
 
-def test_stats_item_kind_filter_changes_the_sample(tmp_path) -> None:
+def test_stats_rejects_the_removed_item_kind_filter(client) -> None:
+    """item_kind 已从服务里移除；传它必须 422，不能被静默忽略。"""
+    run = search_and_wait(client)
+
+    response = client.get(f"/v1/stats?run_id={run['run_id']}&item_kind=body")
+
+    assert response.status_code == 422
+
+
+def test_stats_includes_auction_and_ad_items_and_says_so(tmp_path) -> None:
+    """拍卖起拍价与广告位都留在分布里，但必须计数并给出限制标记。"""
     adapter = FakeAdapter(
         pages=[
             [
-                synthetic_listing("7001", title="合成 X-T4 单机身", price_text="5000"),
-                synthetic_listing("7002", title="合成 X-T4 18-55 套机", price_text="6000"),
+                synthetic_listing("7001", price_text="5000"),
+                synthetic_listing("7002", price_text="100", is_auction=True),
+                synthetic_listing("7003", price_text="9000", is_ad=True),
             ]
         ]
     )
     with build_client(tmp_path, adapter) as test_client:
         run = search_and_wait(test_client)
-        body_only = test_client.get(
-            f"/v1/stats?run_id={run['run_id']}&item_kind=body"
-        ).json()
-        any_kind = test_client.get(f"/v1/stats?run_id={run['run_id']}&item_kind=any").json()
+        body = test_client.get(f"/v1/stats?run_id={run['run_id']}").json()
 
-    assert body_only["eligible_count"] == 1
-    assert body_only["excluded_by_reason"].get("item_kind_mismatch") == 1
-    assert any_kind["eligible_count"] == 2
-    assert "mixed_item_kinds" in any_kind["sample_quality"]
+    assert body["priced_count"] == 3
+    assert body["auction_count"] == 1
+    assert body["ad_count"] == 1
+    assert body["min_yuan"] == "100.00"
+    assert body["max_yuan"] == "9000.00"
+    assert "includes_auction_start_prices" in body["sample_quality"]
+    assert "includes_promoted_ads" in body["sample_quality"]
 
 
 def test_stats_marks_insufficient_sample(client, tmp_path) -> None:
@@ -279,9 +418,29 @@ def test_stats_marks_insufficient_sample(client, tmp_path) -> None:
         run = search_and_wait(test_client)
         body = test_client.get(f"/v1/stats?run_id={run['run_id']}").json()
 
-    assert body["eligible_count"] == 3
+    assert body["priced_count"] == 3
     assert body["insufficient_sample"] is True
     assert "insufficient_sample" in body["sample_quality"]
+
+
+def test_stats_reports_unpriced_breakdown(tmp_path) -> None:
+    adapter = FakeAdapter(
+        pages=[
+            [
+                synthetic_listing("7001", price_text="5000"),
+                synthetic_listing("7002", title="合成 面议", price_text="面议"),
+                synthetic_listing("7003", title="合成 无价格", price_text=None),
+            ]
+        ]
+    )
+    with build_client(tmp_path, adapter) as test_client:
+        run = search_and_wait(test_client)
+        body = test_client.get(f"/v1/stats?run_id={run['run_id']}").json()
+
+    assert body["priced_count"] == 1
+    assert body["unpriced_count"] == 2
+    assert body["unpriced_by_status"] == {"ambiguous": 1, "missing": 1}
+    assert "some_prices_unparsed" in body["sample_quality"]
 
 
 # ---------------------------------------------------------------- 失败语义
