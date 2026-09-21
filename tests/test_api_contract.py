@@ -10,62 +10,10 @@ import time
 from decimal import Decimal
 
 import pytest
-from fastapi.testclient import TestClient
 
-from xps.main import create_app
 from xps.settings import Settings
 from tests.fake_adapter import FakeAdapter, body_listings, synthetic_listing
-
-TERMINAL = {"succeeded", "partial", "failed", "blocked_login"}
-
-
-def build_client(tmp_path, adapter: FakeAdapter, **overrides) -> TestClient:
-    options: dict = {
-        "database_path": tmp_path / "price.sqlite3",
-        "min_seconds_between_searches": 0,
-        "seconds_between_pages": 0,
-        "_env_file": None,
-    }
-    options.update(overrides)
-    return TestClient(create_app(Settings(**options), adapter=adapter))
-
-
-@pytest.fixture
-def adapter() -> FakeAdapter:
-    return FakeAdapter(pages=[body_listings(7001, 8)])
-
-
-@pytest.fixture
-def client(tmp_path, adapter):
-    with build_client(tmp_path, adapter) as test_client:
-        yield test_client
-
-
-def wait_for_run(client: TestClient, run_id: str, timeout: float = 10.0) -> dict:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        response = client.get(f"/v1/search-runs/{run_id}")
-        assert response.status_code == 200, response.text
-        body = response.json()
-        if body["status"] in TERMINAL:
-            return body
-        time.sleep(0.02)
-    pytest.fail(f"run {run_id} 在 {timeout}s 内未结束（任务卡住）")
-
-
-def submit(client: TestClient, payload: dict | None = None):
-    # 用 `is None` 而非真值判断：空 dict 是合法的「缺字段」测试输入
-    return client.post(
-        "/v1/search",
-        json={"keyword": "富士 X-T4", "max_pages": 1} if payload is None else payload,
-    )
-
-
-def search_and_wait(client: TestClient, payload: dict | None = None, **overrides) -> dict:
-    response = submit(client, payload)
-    assert response.status_code == 202, response.text
-    return wait_for_run(client, response.json()["run_id"], **overrides)
-
+from tests.helpers import build_client, search_and_wait, submit, wait_for_run
 
 # ---------------------------------------------------------------- 提交与轮询
 

@@ -17,6 +17,10 @@ KEYWORD_MAX_LENGTH = 64
 PRODUCTS_DEFAULT_LIMIT = 50
 PRODUCTS_MAX_LIMIT = 100
 
+# 上游 SearchFilters 支持这三项，但**平台是否真过滤未经实测验证**。
+# 声明出来是为了给出明确的 UNSUPPORTED_FILTER，而不是静默忽略或谎称已过滤。
+UNVERIFIED_FILTERS = ("city", "province", "publish_days")
+
 
 class SearchSubmitRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -54,15 +58,7 @@ class SearchSubmitRequest(BaseModel):
         return self
 
     def unverified_filters(self) -> list[str]:
-        return [
-            name
-            for name, value in (
-                ("city", self.city),
-                ("province", self.province),
-                ("publish_days", self.publish_days),
-            )
-            if value is not None
-        ]
+        return [name for name in UNVERIFIED_FILTERS if getattr(self, name) is not None]
 
 
 class SearchAccepted(BaseModel):

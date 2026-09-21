@@ -138,7 +138,7 @@ Playwright + Web UI + AI 分析的重型监控系统，面向持续监控而非�
 
 ```
 $ .venv/bin/python -m pytest -q
-326 passed, 4 deselected          # 离线，未访问网络
+359 passed, 4 deselected          # 离线，未访问网络
 ```
 
 覆盖（对应指南 §Phase2 验收与 §11 矩阵）：
@@ -169,7 +169,9 @@ $ .venv/bin/python -m pytest -q
 | GET | `/health` | 进程 + SQLite；登录态丢失**不算**不健康 |
 | GET | `/v1/auth/status` | 本地登录态快照 + `verified` 标志；绝不回传 Cookie / user_id |
 | POST | `/v1/auth/reload` | 重跑 `init()` 重读 `session.json`；登录后免重启。GET → 405 |
-| GET | `/openapi.json`、`/docs` | OpenAPI 文档（实测 `/docs` → HTTP 200，openapi 3.1.0，6 条路径） |
+| GET | `/help` | **agent 自助使用说明**；`?format=text` 出纯文本。见下节 |
+| GET | `/` | 根路径指路，避免 agent 探测时拿到 404 |
+| GET | `/openapi.json`、`/docs` | OpenAPI 文档（实测 `/docs` → HTTP 200，openapi 3.1.0，9 条路径） |
 
 验收（§Phase3）：
 
@@ -232,6 +234,44 @@ macOS 系统代理的 `ExceptionsList` **明确包含 `127.0.0.1`**，但 `urlli
 
 **影响面提示**：任何开着系统代理的 macOS 上，未设 `trust_env=False` 的 Python 客户端都会踩到。
 README「故障处理」已加入该条排查说明。
+
+## Agent 自助发现（`GET /help`）：**pass**
+
+```
+$ .venv/bin/python -m pytest -q tests/test_help.py
+33 passed
+```
+
+动机：OpenAPI 只描述「有什么参数」，不传达**价格口径纪律**与「遇到某个错误码该怎么办」。
+`GET /help` 补上这两类信息，让 agent 不必先读 README 就能正确使用本服务。
+`?format=text` 输出纯文本，便于直接塞进模型上下文。
+
+内容（实测：9 个端点、12 个错误码、6 条 must_report、7 条 must_not）：
+价格口径（是什么/不是什么/单位/分位数算法/null 语义）、一条命令入口、四步调用流程、
+端点清单（含 POST 请求体的必填字段与全部字段）、上限、任务状态语义、失败语义、
+错误码 → `agent_action`、转述必含项、禁止项、登录说明。
+
+**防漂移设计**（这是本端点的主要工程价值，否则 help 会变成一份会撒谎的文档）：
+
+| 内容 | 派生自 | 漂移即失败 |
+|---|---|---|
+| 端点清单 | `app.openapi()` 运行时生成 | `test_help_lists_exactly_the_real_routes` 拿真实路由定义反向核对 |
+| 搜索请求字段 | `SearchSubmitRequest.model_fields` | `test_help_documents_every_search_request_field` |
+| 错误码集合 | `errors.ALL_CODES` | `test_help_covers_every_error_code` |
+| 错误码行动指引 | `errors.AGENT_ACTIONS`（**与 CLI 共用同一份**） | `test_cli_failure_rendering_uses_the_shared_action_text` 逐码断言 |
+| http/retryable/需人工 | `errors.http_status/is_retryable/requires_human` | `test_every_error_code_entry_is_complete_and_consistent` |
+
+为消除重复，原先写在 `cli.py` 里的 `_NEXT_STEPS` 已上提为 `errors.AGENT_ACTIONS`，
+由 CLI 的失败渲染与 `/help` 共同消费 —— 两处不可能再各说一套。
+
+**实现途中发现并绕过的一个版本差异**：FastAPI 0.141.1 把 `include_router` 的结果包成
+`_IncludedRouter`，**不再展平进 `app.routes`**，故 `isinstance(route, APIRoute)` 在顶层匹配不到
+任何路由（交叉核对会变成空集 == 空集的假阳性）。改为经 `original_router` 下钻；同时该版本在
+`add_api_route` 时已把 `router.prefix` 拼进 `route.path`，再乘一次前缀会得到 `/v1/v1/products`。
+两处都写了注释，并加了 `test_route_set_helper_actually_finds_routes` 作为护栏，
+防止 helper 退化成空集后让相等断言静默通过。
+
+`format` 只接受 `json` / `text`，其他值返回 422 `INVALID_QUERY`（实测 `?format=yaml` → 422）。
 
 ## 统计：**pass**
 
@@ -320,8 +360,8 @@ $ .venv/bin/python -m pytest -q tests/test_stats.py tests/test_classify.py
    （`scripts/smoke-local.sh`，run `b1ad3465-6af3-4390-afd2-cff01fd09455`，`status=succeeded`，60 条入库）
 6. 真实数据上的分类与统计：eligible 14(any)/12(body)/2(kit)，套机中位数高于单机身
 7. 真实数据暴露并修复三类误判（见上表），修复后离线复核 + 重新真实采集双验证
-8. `pytest -m live`：**4 passed, 326 deselected in 21.81s**（真实闲鱼，6 次搜索页请求）。
-   改动登录态实现后**重跑过一次**，不是沿用旧结果
+8. `pytest -m live`：**4 passed, 359 deselected in 21.67s**（真实闲鱼，6 次搜索页请求）。
+   改动登录态实现后、以及新增 `/help` 后各**重跑过一次**，不是沿用旧结果
 9. 备份脚本对真实数据库执行：`integrity_check=ok`，行数 `search_runs=1, products=60, observations=60`
 10. `scripts/query-price.sh "富士 X-T4" --kind body --pages 1` 真实跑通，退出码 0：
     run `864e02c6-5891-4d98-9eb2-f8604c7534f7`，30 条原始 → 合格 4 件、排除 20、待核验 6，
@@ -333,11 +373,11 @@ $ .venv/bin/python -m pytest -q tests/test_stats.py tests/test_classify.py
 12. `POST /v1/auth/reload` 与 `GET /v1/auth/status` 对运行中的真实服务调用成功，
     返回 `verified: false`；`GET /v1/auth/reload` 正确返回 405
 
-真实请求总量：**21 次搜索页请求**（另有每个进程/事件循环初始化时的 2 次 token 请求），
-分布在 9 次独立运行中，页间隔 ≥ 3 秒、轮次间隔 ≥ 12 秒。**全程未触发验证码、风控或拒绝。**
+真实请求总量：**27 次搜索页请求**（另有每个进程/事件循环初始化时的 2 次 token 请求），
+分布在 10 次独立运行中，页间隔 ≥ 3 秒、轮次间隔 ≥ 12 秒。**全程未触发验证码、风控或拒绝。**
 
 明细：`verify_upstream.py` 1 页 + 2 页 + 1 页重抓 = 4；`smoke-local.sh` 两轮各 2 页 = 4；
-`pytest -m live` 两次各 6 = 12；`query-price.sh` 1 页 = 1。
+`pytest -m live` 三次各 6 = 18；`query-price.sh` 1 页 = 1。
 
 ## 仅离线 fixture 验证范围（`NOT_VERIFIED_LIVE`）
 
@@ -399,12 +439,13 @@ scripts/setup.sh  start-local.sh  login.sh  query-price.sh  smoke-local.sh
 scripts/backup-sqlite.sh  verify_upstream.py
 src/xps/__init__.py  main.py  settings.py  errors.py  cli.py
 src/xps/adapters/base.py  xianyu.py
-src/xps/api/schemas.py  deps.py  search.py  products.py  stats.py  system.py
+src/xps/api/schemas.py  deps.py  help.py  search.py  products.py  stats.py  system.py
 src/xps/services/normalize.py  identity.py  classify.py  statistics.py  search_service.py
 src/xps/storage/db.py  schema.sql  repository.py
+tests/conftest.py  helpers.py                    共享 fixture 与路由核对辅助
 tests/test_price_normalize.py  test_identity.py  test_classify.py  test_stats.py
 tests/test_normalize.py  test_repository.py  test_api_contract.py
-tests/test_adapter_lifecycle.py  test_cli.py
+tests/test_adapter_lifecycle.py  test_cli.py  test_help.py
 tests/test_smoke_live.py                         -m live，默认排除
 tests/fake_adapter.py  tests/fixtures/mtop_entry.py     均标注 SYNTHETIC
 ```
@@ -416,6 +457,7 @@ tests/fake_adapter.py  tests/fixtures/mtop_entry.py     均标注 SYNTHETIC
 ### Git 提交
 
 ```
+41dd031 docs: 补齐登录态持久化语义、agent 客户端与代理排查
 32a581c feat: 登录态改为进程内长期有效，并新增 agent 一键查询客户端
 03f339a docs: README、实施报告与运维脚本
 422ff88 fix: 用真实数据修正分类误删，并让上游 init 按事件循环幂等
@@ -424,7 +466,7 @@ a731f5d feat: 标准化、身份、分类、统计与 SQLite 存储层（Phase 2
 f4e217f docs: 记录 Gate A 实测证据与设计决策，钉死上游 commit
 ```
 
-（本节与 README 的这轮更新在其后单独提交，故未列出自身哈希。）
+（`/help` 端点与本轮文档更新在其后提交，故未列出自身哈希。）
 
 ---
 

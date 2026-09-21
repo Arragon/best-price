@@ -119,6 +119,31 @@ curl -sS -X POST http://127.0.0.1:8765/v1/auth/reload
 
 ## API
 
+### 先读 `/help`：agent 自助发现
+
+不需要事先读文档。`GET /help` 返回机器可读的完整使用说明：
+
+```bash
+curl -sS http://127.0.0.1:8765/help                 # JSON
+curl -sS "http://127.0.0.1:8765/help?format=text"   # 纯文本，便于直接塞进模型上下文
+curl -sS http://127.0.0.1:8765/                     # 根路径指路，不会 404
+```
+
+它比 OpenAPI 多给出两类**OpenAPI 表达不了**的信息：
+
+- **价格口径纪律** —— 这是在售报价不是成交价、`null` 就是缺失而非占位、分位数算法、
+  `must_report`（转述给用户时必须包含的 6 项）与 `must_not`（7 条禁止事项）
+- **错误码 → 行动指引** —— 12 个错误码各自带 `http_status` / `retryable` /
+  `requires_human_action` / `agent_action`，告诉调用方**下一步该做什么**，而不只是发生了什么
+
+`/help` 不会与实际 API 漂移：端点清单从 `app.openapi()` 派生，请求字段清单从
+`SearchSubmitRequest` 派生，错误码行动指引与 `scripts/query-price.sh` 共用
+`errors.AGENT_ACTIONS` 同一份数据。另有测试直接遍历真实路由对象反向核对，
+所以任何一方改动而另一方没跟上，测试就会红。
+
+`city` / `province` / `publish_days` 在 `/help` 里被明确列为 `unsupported_filters`
+并附原因，agent 不必靠试错去撞 422。
+
 ### Agent 调用流程
 
 **推荐**：直接用 `scripts/query-price.sh`（见「快速开始」），它已经实现了下面整套流程，
@@ -440,10 +465,10 @@ httpx.Client(base_url="http://127.0.0.1:8765", trust_env=False)   # 只连本机
 环境    macOS 26.6.2 (Darwin arm64) / CPython 3.12.13 / pytest 9.1.1 / fastapi 0.141.1
 
 命令    .venv/bin/python -m pytest -q
-结果    326 passed, 4 deselected          （离线，未访问网络；耗时 2–8s 随机器负载浮动）
+结果    359 passed, 4 deselected          （离线，未访问网络；耗时 5–9s 随机器负载浮动）
 
 命令    .venv/bin/python -m pytest -m live -q
-结果    4 passed, 326 deselected in 21.81s （真实闲鱼，guest，6 次搜索页请求）
+结果    4 passed, 359 deselected in 21.67s （真实闲鱼，guest，6 次搜索页请求）
 ```
 
 ---
@@ -488,6 +513,7 @@ src/xps/
 ├── api/
 │   ├── schemas.py        外部 API 数据类型
 │   ├── deps.py           共享依赖（含「失败 run 不得退化成 200+[]」）
+│   ├── help.py           GET /help：agent 自助发现，从 openapi() 与请求模型派生，不会漂移
 │   ├── search.py  products.py  stats.py  system.py
 ├── services/
 │   ├── search_service.py 任务生命周期、串行锁、节流、标准化入库
@@ -501,7 +527,8 @@ src/xps/
     └── repository.py
 scripts/   setup.sh start-local.sh login.sh query-price.sh smoke-local.sh
            backup-sqlite.sh verify_upstream.py
-tests/     离线单测与 API 契约 + fake_adapter.py + fixtures/ + test_smoke_live.py(-m live)
+tests/     conftest.py helpers.py fake_adapter.py fixtures/（均标注 SYNTHETIC）
+           离线单测与 API 契约 + test_help.py + test_smoke_live.py(-m live)
 data/      gitignored：price.sqlite3、backups/、probe/、upstream-commit.txt
 upstream/  gitignored：上游独立 checkout，许可未确认
 ```

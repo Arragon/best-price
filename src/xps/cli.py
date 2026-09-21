@@ -13,6 +13,8 @@ from typing import Any, Sequence
 
 import httpx
 
+from xps.errors import AGENT_ACTIONS
+
 TERMINAL_STATUSES = frozenset({"succeeded", "partial", "failed", "blocked_login"})
 
 EXIT_OK = 0
@@ -23,40 +25,6 @@ EXIT_TIMEOUT = 4
 KIND_LABELS = {"body": "单机身", "kit": "套机", "any": "不限（可能混合配置）"}
 
 SORT_OPTIONS = ("newest", "price_asc", "price_desc", "default")
-
-_NEXT_STEPS = {
-    "CHALLENGE_REQUIRED": (
-        "停止自动操作。请用户本人到闲鱼 App 或网页完成验证后再重试；不要自动重试。"
-    ),
-    "RATE_LIMITED": (
-        "已触发平台频率限制。不要继续重试，也不要换账号或代理；"
-        "请调大 MIN_SECONDS_BETWEEN_SEARCHES，由用户决定何时再跑。"
-    ),
-    "AUTH_EXPIRED": (
-        "登录态已失效。请用户在本机运行 scripts/login.sh 重新扫码，"
-        "然后 POST /v1/auth/reload（无需重启服务）。"
-    ),
-    "AUTH_REQUIRED": (
-        "该操作需要登录态。请用户在本机运行 scripts/login.sh，然后 POST /v1/auth/reload。"
-    ),
-    "UPSTREAM_TIMEOUT": "上游超时。可有限次退避重试；不要并发重试造成放大。",
-    "UPSTREAM_CHANGED": (
-        "平台或上游接口结构可能已变。请重跑 scripts/verify_upstream.py 核对字段路径。"
-    ),
-    "UPSTREAM_UNAVAILABLE": (
-        "上游不可用。检查网络、upstream/ checkout 是否存在、依赖是否装齐（scripts/setup.sh）。"
-    ),
-    "RUN_INTERRUPTED": "服务曾在本轮采集中途重启。请重新发起搜索。",
-    "DB_ERROR": "本地数据库错误。查看服务日志；必要时用 data/backups/ 里的备份恢复。",
-    "NO_VALID_RESULTS": (
-        "本轮没有合格样本。查看 excluded_by_reason 与 needs_review_count，"
-        "考虑换关键词或放宽 item_kind。"
-    ),
-    "INVALID_QUERY": "请求参数不合法。检查关键词长度、max_pages 上限、价格区间与 sort 取值。",
-    "UNSUPPORTED_FILTER": (
-        "该筛选条件未经验证平台是否真过滤，已拒绝。去掉它，或先做一次人工交叉核对再开放。"
-    ),
-}
 
 _DEFAULT_STEP = "查看服务日志；必要时重跑 scripts/verify_upstream.py 核对上游接口。"
 
@@ -164,7 +132,7 @@ def render_failure(run: dict[str, Any]) -> str:
         + ("是（需要人工处理）" if error.get("requires_human_action") else "否"),
         f"已抓页数 : {run.get('pages_fetched')}/{run.get('pages_requested')}",
         "",
-        "下一步：" + _NEXT_STEPS.get(code, _DEFAULT_STEP),
+        "下一步：" + AGENT_ACTIONS.get(code, _DEFAULT_STEP),
     ]
     warnings = run.get("warnings") or []
     if warnings:
@@ -199,7 +167,7 @@ def _error_text(response: httpx.Response) -> str:
         lines.append("可重试：是")
     if body.get("requires_human_action"):
         lines.append("需要人工处理：是")
-    step = _NEXT_STEPS.get(str(body.get("code")))
+    step = AGENT_ACTIONS.get(str(body.get("code")))
     if step:
         lines.append("下一步：" + step)
     return "\n".join(lines)

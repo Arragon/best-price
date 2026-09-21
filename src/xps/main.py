@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 
 from xps import __version__
 from xps.adapters.xianyu import XianyuUpstreamAdapter
+from xps.api import help as help_api
 from xps.api import products, search, stats, system
 from xps.errors import DB_ERROR, INVALID_QUERY, ServiceError, is_retryable, requires_human
 from xps.services.search_service import SearchService
@@ -48,7 +49,7 @@ APP_DESCRIPTION = """
 不要继续自动重试。
 """
 
-_Routers = (search, products, stats, system)
+_Routers = (help_api, search, products, stats, system)
 
 
 @asynccontextmanager
