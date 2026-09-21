@@ -35,17 +35,40 @@ async def health(request: Request) -> HealthResponse:
     )
 
 
-@router.get(
-    "/v1/auth/status",
-    response_model=AuthStatusResponse,
-    summary="机器可读的登录态",
-    description="只回传状态枚举，绝不回传 Cookie、token 或 user_id 原值。",
-)
-async def auth_status(request: Request) -> AuthStatusResponse:
-    status = await request.app.state.adapter.auth_status()
+def _to_response(status) -> AuthStatusResponse:
     return AuthStatusResponse(
         state=status.state,
         # 失效/需人工时即使适配器没标注也强制置真，避免调用方误以为可以继续
         requires_human_action=status.requires_human_action or status.state in _HUMAN_STATES,
         hint=status.hint,
+        verified=status.verified,
     )
+
+
+@router.get(
+    "/v1/auth/status",
+    response_model=AuthStatusResponse,
+    summary="机器可读的登录态（只读本地凭证）",
+    description=(
+        "只回传状态枚举，绝不回传 Cookie、token 或 user_id 原值。\n\n"
+        "`verified=false` 表示**未向平台主动校验**：上游 `probe_login()` 在任何异常时"
+        "都会删除 `session.json`，一次网络抖动就能毁掉扫码换来的登录态。本项目改为"
+        "「一次登录后进程内长期有效，不主动过期」，真实失效会在搜索时以 `AUTH_EXPIRED` 报出。"
+    ),
+)
+async def auth_status(request: Request) -> AuthStatusResponse:
+    return _to_response(await request.app.state.adapter.auth_status())
+
+
+@router.post(
+    "/v1/auth/reload",
+    response_model=AuthStatusResponse,
+    summary="重新读取登录态（登录后免重启）",
+    description=(
+        "在本机另开终端跑完 `scripts/login.sh` 后调用，服务会重跑上游 `init()` "
+        "重新加载 `session.json`。不需要重启进程。\n\n"
+        "该操作不向平台校验、不修改也不删除任何凭证文件。"
+    ),
+)
+async def reload_auth(request: Request) -> AuthStatusResponse:
+    return _to_response(await request.app.state.adapter.reload())

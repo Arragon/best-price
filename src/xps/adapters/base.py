@@ -78,6 +78,8 @@ class AuthStatus:
     state: str
     requires_human_action: bool = False
     hint: str | None = None
+    # 是否已向平台主动校验过。本项目默认 False：主动校验会触发上游销毁凭证的分支
+    verified: bool = False
 
 
 @runtime_checkable
@@ -93,3 +95,7 @@ class XianyuAdapter(Protocol):
     ) -> CrawlResult: ...
 
     async def auth_status(self) -> AuthStatus: ...
+
+    async def reload(self) -> AuthStatus:
+        """重新加载本地凭证（用户在别处登录后调用，免重启）。"""
+        ...

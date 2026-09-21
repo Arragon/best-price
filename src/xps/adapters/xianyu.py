@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import Any
 
 from xps.adapters.base import (
-    AUTH_EXPIRED,
     AUTH_GUEST,
     AUTH_LOGGED_IN,
     AUTH_UNKNOWN,
@@ -234,25 +233,45 @@ class XianyuUpstreamAdapter:
     # -- 契约实现 ----------------------------------------------------------
 
     async def auth_status(self) -> AuthStatus:
+        """只读**本地内存**登录态快照，不向平台主动校验。
+
+        为什么不调用上游 `probe_login()`：它在 `fetch_login_user()` 抛**任何**异常时
+        都会走 `invalidate_expired_login()`，而后者 `client.cookies.clear()` 并
+        `clear_session()` —— 直接删除 `session.json`。也就是一次网络抖动就能毁掉
+        用户扫码换来的登录态，逼人重新扫脸。
+
+        因此本项目改为：一次登录后，凭证在本进程生命周期内持续有效，不主动过期。
+        真实失效由搜索时平台返回的 `ret` 码反映（映射为 AUTH_EXPIRED / AUTH_REQUIRED），
+        那是有证据的被动判定，不会误删凭证。
+        """
         try:
             await self._ensure_init()
-            snapshot = await self._mtop.probe_login()
+            snapshot = self._mtop.login_snapshot()
         except UpstreamError as exc:
             return AuthStatus(AUTH_UNKNOWN, hint=exc.message)
         except Exception as exc:
-            logger.warning("probe_login 失败：%s", type(exc).__name__)
-            return AuthStatus(AUTH_UNKNOWN, hint="登录态探测失败")
+            logger.warning("读取本地登录态失败：%s", type(exc).__name__)
+            return AuthStatus(AUTH_UNKNOWN, hint="无法读取本地登录态")
 
+        # 只回传机器可读状态，绝不回传 Cookie / user_id 原值
         if snapshot.get("logged_in"):
-            return AuthStatus(AUTH_LOGGED_IN)
-        if snapshot.get("login_expired"):
-            # 只回传机器可读状态，绝不回传 Cookie / user_id 原值
             return AuthStatus(
-                AUTH_EXPIRED,
-                requires_human_action=True,
-                hint="登录已失效；如需登录态数据请在本机运行 scripts/login.sh",
+                AUTH_LOGGED_IN,
+                hint="本地登录态有效；未向平台主动校验，真实失效会在搜索时以 AUTH_EXPIRED 报出",
             )
-        return AuthStatus(AUTH_GUEST)
+        return AuthStatus(
+            AUTH_GUEST,
+            hint="未登录（guest 可搜索）；如需登录态请在本机运行 scripts/login.sh 后调用 POST /v1/auth/reload",
+        )
+
+    async def reload(self) -> AuthStatus:
+        """重跑 init() 以重新读取 session.json。
+
+        用户在另一个终端执行 scripts/login.sh 后调用，无需重启服务。
+        （上游 login_snapshot() 读的是内存 cookie jar，不会自己感知磁盘变化。）
+        """
+        self._init_loop = None
+        return await self.auth_status()
 
     async def search(
         self,
@@ -331,8 +350,11 @@ def _classify_upstream_exception(exc: Exception) -> tuple[str, str]:
         return "CHALLENGE_REQUIRED", "平台要求人工验证，已停止自动操作"
     if "FLOW_LIMIT" in text or "ILLEGAL_ACCESS" in text or "LIMIT" in text:
         return "RATE_LIMITED", "触发平台频率限制，已停止自动重试"
-    if "SESSION_EXPIRED" in text or "NEED_LOGIN" in text:
-        return "AUTH_REQUIRED", "需要登录态"
+    if "SESSION_EXPIRED" in text:
+        # 曾登录、凭证已失效 → 让用户重新登录；与「从未登录」的指引不同
+        return "AUTH_EXPIRED", "登录会话已过期，请重新运行 scripts/login.sh"
+    if "NEED_LOGIN" in text:
+        return "AUTH_REQUIRED", "该操作需要登录态"
     if "TOKEN_EMPTY" in text or "TOKEN_EXPIRED" in text or "_EXPIRED" in text:
         return "AUTH_EXPIRED", "上游 token 失效"
     if "FAIL_SYS" in text or "调用失败" in str(exc):

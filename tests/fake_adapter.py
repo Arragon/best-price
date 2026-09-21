@@ -82,6 +82,7 @@ class FakeAdapter:
     calls: list[dict] = field(default_factory=list)
     active: int = 0
     max_active: int = 0
+    reload_calls: int = 0
 
     async def search(
         self,
@@ -135,3 +136,7 @@ class FakeAdapter:
         if self.auth_error is not None:
             raise self.auth_error
         return AuthStatus(self.auth_mode)
+
+    async def reload(self) -> AuthStatus:
+        self.reload_calls += 1
+        return await self.auth_status()

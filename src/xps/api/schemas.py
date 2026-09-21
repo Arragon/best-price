@@ -181,6 +181,8 @@ class AuthStatusResponse(BaseModel):
     state: str
     requires_human_action: bool
     hint: str | None = None
+    # False 表示只读了本地凭证、未向平台主动校验（主动校验会触发上游销毁凭证的分支）
+    verified: bool = False
 
 
 class ErrorResponse(BaseModel):

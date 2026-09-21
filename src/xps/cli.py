@@ -1,0 +1,350 @@
+"""一条命令完成 POST → poll → stats → products，输出可直接转述给用户的结果。
+
+设计重点不在 HTTP 编排，而在 `render_report` / `render_failure`：它们把
+「必须转述的口径与限制」固化成代码，让调用方（人或 agent）无法只报一个中位数就走。
+"""
+
+from __future__ import annotations
+
+import argparse
+import time
+from dataclasses import dataclass
+from typing import Any, Sequence
+
+import httpx
+
+TERMINAL_STATUSES = frozenset({"succeeded", "partial", "failed", "blocked_login"})
+
+EXIT_OK = 0
+EXIT_USAGE = 2
+EXIT_CRAWL_FAILED = 3
+EXIT_TIMEOUT = 4
+
+KIND_LABELS = {"body": "单机身", "kit": "套机", "any": "不限（可能混合配置）"}
+
+SORT_OPTIONS = ("newest", "price_asc", "price_desc", "default")
+
+_NEXT_STEPS = {
+    "CHALLENGE_REQUIRED": (
+        "停止自动操作。请用户本人到闲鱼 App 或网页完成验证后再重试；不要自动重试。"
+    ),
+    "RATE_LIMITED": (
+        "已触发平台频率限制。不要继续重试，也不要换账号或代理；"
+        "请调大 MIN_SECONDS_BETWEEN_SEARCHES，由用户决定何时再跑。"
+    ),
+    "AUTH_EXPIRED": (
+        "登录态已失效。请用户在本机运行 scripts/login.sh 重新扫码，"
+        "然后 POST /v1/auth/reload（无需重启服务）。"
+    ),
+    "AUTH_REQUIRED": (
+        "该操作需要登录态。请用户在本机运行 scripts/login.sh，然后 POST /v1/auth/reload。"
+    ),
+    "UPSTREAM_TIMEOUT": "上游超时。可有限次退避重试；不要并发重试造成放大。",
+    "UPSTREAM_CHANGED": (
+        "平台或上游接口结构可能已变。请重跑 scripts/verify_upstream.py 核对字段路径。"
+    ),
+    "UPSTREAM_UNAVAILABLE": (
+        "上游不可用。检查网络、upstream/ checkout 是否存在、依赖是否装齐（scripts/setup.sh）。"
+    ),
+    "RUN_INTERRUPTED": "服务曾在本轮采集中途重启。请重新发起搜索。",
+    "DB_ERROR": "本地数据库错误。查看服务日志；必要时用 data/backups/ 里的备份恢复。",
+    "NO_VALID_RESULTS": (
+        "本轮没有合格样本。查看 excluded_by_reason 与 needs_review_count，"
+        "考虑换关键词或放宽 item_kind。"
+    ),
+    "INVALID_QUERY": "请求参数不合法。检查关键词长度、max_pages 上限、价格区间与 sort 取值。",
+    "UNSUPPORTED_FILTER": (
+        "该筛选条件未经验证平台是否真过滤，已拒绝。去掉它，或先做一次人工交叉核对再开放。"
+    ),
+}
+
+_DEFAULT_STEP = "查看服务日志；必要时重跑 scripts/verify_upstream.py 核对上游接口。"
+
+
+@dataclass(frozen=True)
+class QueryResult:
+    exit_code: int
+    report: str
+    run: dict[str, Any] | None = None
+    stats: dict[str, Any] | None = None
+
+
+def _yuan(value: str | None) -> str:
+    return f"¥{value}" if value else "—"
+
+
+# ---------------------------------------------------------------- 渲染
+
+
+def render_report(
+    *,
+    run: dict[str, Any],
+    stats: dict[str, Any],
+    products: Sequence[dict[str, Any]],
+    top: int = 5,
+) -> str:
+    kind = stats.get("item_kind") or "any"
+    eligible = stats.get("eligible_count") or 0
+    lines: list[str] = [
+        f"══ 闲鱼在售报价 · {run.get('keyword')} · {KIND_LABELS.get(kind, kind)} ══",
+        "",
+        "口径：以下是**采集时刻的公开在售报价**，不是成交价，不含国补 / 优惠券 / 议价结果。",
+        "",
+    ]
+
+    if eligible:
+        lines.append(f"中位数 {_yuan(stats.get('median_yuan'))}    合格样本 {eligible} 件")
+        lines.append(
+            f"  min {_yuan(stats.get('min_yuan'))} · P25 {_yuan(stats.get('p25_yuan'))}"
+            f" · P75 {_yuan(stats.get('p75_yuan'))} · max {_yuan(stats.get('max_yuan'))}"
+        )
+    else:
+        lines.append("中位数 —    合格样本 0 件（无可用样本；这是筛选结果，不代表平台查不到商品）")
+
+    lines += [
+        "",
+        f"样本构成：原始 {stats.get('raw_count')} 条 → 去重 {stats.get('distinct_count')} 件",
+        f"  合格 {eligible} · 排除 {stats.get('excluded_count')}"
+        f" · 待核验 {stats.get('needs_review_count')}"
+        f" · 异常低价 {stats.get('suspicious_price_count')}",
+    ]
+    reasons = stats.get("excluded_by_reason") or {}
+    if reasons:
+        ordered = sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0]))
+        lines.append("  排除原因：" + " · ".join(f"{name} {count}" for name, count in ordered))
+
+    lines.append("")
+    if stats.get("insufficient_sample"):
+        lines.append(
+            f"⚠ 样本不足：合格样本 {eligible} 件 < 8。"
+            "以上数字只反映已采集到的样本，不要据此下确定性结论。"
+        )
+    if stats.get("partial"):
+        lines.append("⚠ 本轮仅部分页采集成功，样本可能不完整。")
+    quality = stats.get("sample_quality") or []
+    if quality:
+        lines.append("采集质量限制：" + " · ".join(str(item) for item in quality))
+
+    entries = list(products[:top]) if products else list(stats.get("lowest_items") or [])
+    if entries:
+        lines += ["", "最低样本（可点开核对；链接已剥除跟踪参数）："]
+        for entry in entries:
+            title = str(entry.get("title") or "(无标题)").replace("\n", " ")[:46]
+            lines.append(f"  {_yuan(entry.get('price_yuan')):>10}  {title}")
+            if entry.get("canonical_url"):
+                lines.append(f"{'':>13}{entry['canonical_url']}")
+
+    lines += [
+        "",
+        f"来源：run_id={run.get('run_id')}",
+        f"      采集 {run.get('started_at')} → {run.get('ended_at')}"
+        f" · auth={run.get('auth_mode')}"
+        f" · pages={run.get('pages_fetched')}/{run.get('pages_requested')}",
+        f"      adapter={run.get('adapter_version')}"
+        f" · upstream_commit={run.get('source_commit')}",
+        "",
+        "转述给用户时必须包含：口径（在售报价，非成交价）、样本量、排除原因、"
+        "采集质量限制、商品链接。",
+    ]
+    return "\n".join(lines)
+
+
+def render_failure(run: dict[str, Any]) -> str:
+    error = run.get("error") or {}
+    code = error.get("code") or "UNKNOWN"
+    lines = [
+        "✗ 本轮采集未成功。这是采集失败，不是「平台查不到商品」。",
+        "",
+        f"run_id : {run.get('run_id')}",
+        f"status : {run.get('status')}",
+        f"错误码 : {code}",
+        f"原因   : {error.get('message') or '（未提供）'}",
+        f"可重试 : {'是' if error.get('retryable') else '否'}",
+        "requires_human_action : "
+        + ("是（需要人工处理）" if error.get("requires_human_action") else "否"),
+        f"已抓页数 : {run.get('pages_fetched')}/{run.get('pages_requested')}",
+        "",
+        "下一步：" + _NEXT_STEPS.get(code, _DEFAULT_STEP),
+    ]
+    warnings = run.get("warnings") or []
+    if warnings:
+        lines.append("")
+        lines.append("警告：" + " · ".join(str(item) for item in warnings))
+    return "\n".join(lines)
+
+
+def _service_down_text(detail: str) -> str:
+    return "\n".join(
+        [
+            "✗ 连不上本地服务。",
+            f"  {detail}",
+            "",
+            "先启动： scripts/start-local.sh",
+            "默认地址 http://127.0.0.1:8765；改过端口就用 --base-url 指定。",
+        ]
+    )
+
+
+def _error_text(response: httpx.Response) -> str:
+    try:
+        body = response.json()
+    except ValueError:
+        return f"✗ 请求被拒（HTTP {response.status_code}）：{response.text[:300]}"
+    lines = [
+        f"✗ 请求被拒（HTTP {response.status_code}）",
+        f"错误码：{body.get('code')}",
+        f"说明：{body.get('message')}",
+    ]
+    if body.get("retryable"):
+        lines.append("可重试：是")
+    if body.get("requires_human_action"):
+        lines.append("需要人工处理：是")
+    step = _NEXT_STEPS.get(str(body.get("code")))
+    if step:
+        lines.append("下一步：" + step)
+    return "\n".join(lines)
+
+
+def _timeout_text(run_id: str, run: dict[str, Any] | None, timeout: float) -> str:
+    return "\n".join(
+        [
+            f"✗ 轮询超时（{timeout:.0f}s），任务仍未结束。",
+            f"run_id : {run_id}",
+            f"最后状态：{(run or {}).get('status')}",
+            "",
+            f"稍后自行查询： curl -sS <BASE>/v1/search-runs/{run_id}",
+            "注意：服务重启会把遗留任务判为 failed + RUN_INTERRUPTED。",
+        ]
+    )
+
+
+# ---------------------------------------------------------------- 编排
+
+
+def query(
+    client: httpx.Client,
+    *,
+    keyword: str,
+    item_kind: str = "any",
+    max_pages: int = 1,
+    sort: str = "newest",
+    min_price: str | None = None,
+    max_price: str | None = None,
+    poll_interval: float = 2.0,
+    timeout: float = 300.0,
+    top: int = 5,
+) -> QueryResult:
+    try:
+        health = client.get("/health")
+    except httpx.HTTPError as exc:
+        return QueryResult(EXIT_USAGE, _service_down_text(f"{type(exc).__name__}: {exc}"))
+    if health.status_code != 200:
+        return QueryResult(EXIT_USAGE, _service_down_text(f"/health → HTTP {health.status_code}"))
+
+    try:
+        auth = client.get("/v1/auth/status").json()
+    except (httpx.HTTPError, ValueError):
+        auth = {}
+
+    payload: dict[str, Any] = {
+        "keyword": keyword,
+        "max_pages": max_pages,
+        "sort": sort,
+        "item_kind": item_kind,
+    }
+    if min_price is not None:
+        payload["min_price_yuan"] = str(min_price)
+    if max_price is not None:
+        payload["max_price_yuan"] = str(max_price)
+
+    try:
+        accepted = client.post("/v1/search", json=payload)
+    except httpx.HTTPError as exc:
+        return QueryResult(EXIT_USAGE, _service_down_text(f"{type(exc).__name__}: {exc}"))
+    if accepted.status_code != 202:
+        return QueryResult(EXIT_USAGE, _error_text(accepted))
+    run_id = accepted.json()["run_id"]
+
+    deadline = time.monotonic() + timeout
+    run: dict[str, Any] = {}
+    while True:
+        try:
+            run = client.get(f"/v1/search-runs/{run_id}").json()
+        except (httpx.HTTPError, ValueError) as exc:
+            return QueryResult(EXIT_USAGE, _service_down_text(f"轮询失败：{exc}"))
+        if run.get("status") in TERMINAL_STATUSES:
+            break
+        if time.monotonic() >= deadline:
+            return QueryResult(EXIT_TIMEOUT, _timeout_text(run_id, run, timeout), run=run)
+        time.sleep(poll_interval)
+
+    if run.get("status") in {"failed", "blocked_login"}:
+        return QueryResult(EXIT_CRAWL_FAILED, render_failure(run), run=run)
+
+    params = {"run_id": run_id, "item_kind": item_kind}
+    try:
+        stats = client.get("/v1/stats", params=params).json()
+        products = client.get(
+            "/v1/products", params={**params, "eligible_only": True, "limit": top}
+        ).json()
+    except (httpx.HTTPError, ValueError) as exc:
+        return QueryResult(EXIT_USAGE, _service_down_text(f"取结果失败：{exc}"), run=run)
+
+    header = f"登录态：{auth.get('state', 'unknown')}"
+    if auth.get("verified") is False:
+        header += "（本地凭证，未向平台主动校验）"
+
+    body = render_report(
+        run=run, stats=stats, products=products.get("items") or [], top=top
+    )
+    return QueryResult(EXIT_OK, f"{header}\n\n{body}", run=run, stats=stats)
+
+
+def build_client(base_url: str, timeout: float = 60.0) -> httpx.Client:
+    """只连本机，故 `trust_env=False`：不读 HTTP_PROXY，也不读 macOS 系统代理。
+
+    实测坑：macOS 系统代理（如 127.0.0.1:7890）的 ExceptionsList 虽然包含 127.0.0.1，
+    但 `urllib.request.getproxies()` **不应用** bypass 列表，而 httpx 用的正是它 ——
+    于是连本机 API 也被塞给代理，拿回 502。curl 会自己应用 bypass，所以
+    curl 通、httpx 不通，极易被误判成服务挂了。
+    """
+    return httpx.Client(base_url=base_url, timeout=timeout, trust_env=False)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="闲鱼在售报价一键查询（POST → poll → stats → products）",
+        epilog="退出码：0 成功 / 2 服务或参数问题 / 3 采集失败 / 4 轮询超时",
+    )
+    parser.add_argument("keyword", help="搜索关键词，如「富士 X-T4」")
+    parser.add_argument("--kind", default="any", choices=sorted(KIND_LABELS),
+                        help="body=单机身 / kit=套机 / any=不限（默认）")
+    parser.add_argument("--pages", type=int, default=1, help="抓取页数，默认 1")
+    parser.add_argument("--sort", default="newest", choices=SORT_OPTIONS)
+    parser.add_argument("--min-price", help="最低价（元）")
+    parser.add_argument("--max-price", help="最高价（元）")
+    parser.add_argument("--base-url", default="http://127.0.0.1:8765")
+    parser.add_argument("--timeout", type=float, default=300.0, help="轮询总超时秒数")
+    parser.add_argument("--poll-interval", type=float, default=2.0)
+    parser.add_argument("--top", type=int, default=5, help="列出最低 N 件样本")
+    args = parser.parse_args(argv)
+
+    with build_client(args.base_url) as client:
+        result = query(
+            client,
+            keyword=args.keyword,
+            item_kind=args.kind,
+            max_pages=args.pages,
+            sort=args.sort,
+            min_price=args.min_price,
+            max_price=args.max_price,
+            poll_interval=args.poll_interval,
+            timeout=args.timeout,
+            top=args.top,
+        )
+    print(result.report)
+    return result.exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

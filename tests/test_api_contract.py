@@ -469,6 +469,30 @@ def test_auth_status_never_leaks_credentials(tmp_path) -> None:
     assert response.json()["requires_human_action"] is True
 
 
+def test_auth_status_declares_it_is_not_platform_verified(client) -> None:
+    """不向平台主动校验就必须如实说明，否则调用方会误以为凭证已确认有效。"""
+    assert client.get("/v1/auth/status").json()["verified"] is False
+
+
+def test_auth_reload_picks_up_new_credentials_without_restart(tmp_path) -> None:
+    """用户在另一个终端跑完 scripts/login.sh 后，不必重启服务。"""
+    adapter = FakeAdapter(auth_mode="guest")
+    with build_client(tmp_path, adapter) as test_client:
+        assert test_client.get("/v1/auth/status").json()["state"] == "guest"
+
+        adapter.auth_mode = "logged_in"  # 模拟 session.json 被登录脚本写入
+        body = test_client.post("/v1/auth/reload").json()
+
+        assert body["state"] == "logged_in"
+        assert adapter.reload_calls == 1
+        assert test_client.get("/v1/auth/status").json()["state"] == "logged_in"
+
+
+def test_auth_reload_is_not_reachable_by_get(client) -> None:
+    """改状态的操作必须是 POST，避免被预取/爬虫式 GET 意外触发。"""
+    assert client.get("/v1/auth/reload").status_code == 405
+
+
 # ---------------------------------------------------------------- 文档
 
 

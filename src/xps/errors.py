@@ -81,7 +81,7 @@ _REQUIRES_HUMAN = {
 }
 
 # 出现即必须停止自动操作，交还用户（指南 §9 失败策略）
-HALT_CODES = frozenset({CHALLENGE_REQUIRED, RATE_LIMITED, AUTH_REQUIRED})
+HALT_CODES = frozenset({CHALLENGE_REQUIRED, RATE_LIMITED, AUTH_REQUIRED, AUTH_EXPIRED})
 
 
 def http_status(code: str) -> int:
