@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 AUTH_LOGGED_IN = "logged_in"
 AUTH_GUEST = "guest"
@@ -21,6 +21,7 @@ AUTH_UNKNOWN = "unknown"
 AUTH_HUMAN_ACTION = "human_action_required"
 
 SORT_OPTIONS = ("newest", "price_asc", "price_desc", "default")
+PageOutcomeKind = Literal["fetched", "exhausted", "error"]
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,23 @@ class PageOutcome:
     listings: tuple[RawListing, ...] = ()
     error_code: str | None = None
     error_message: str | None = None
+    # Keep `fetched` for internal backward compatibility while making a normal
+    # end-of-pagination unambiguously different from a failed request.
+    outcome_kind: PageOutcomeKind | None = None
+
+    @property
+    def kind(self) -> PageOutcomeKind:
+        if self.outcome_kind is not None:
+            return self.outcome_kind
+        return "fetched" if self.fetched else "error"
+
+    @property
+    def is_error(self) -> bool:
+        return self.kind == "error"
+
+    @property
+    def exhausted(self) -> bool:
+        return self.kind == "exhausted"
 
     @property
     def item_count(self) -> int:
@@ -105,6 +123,10 @@ class CrawlResult:
     @property
     def pages_fetched(self) -> int:
         return sum(1 for page in self.pages if page.fetched)
+
+    @property
+    def exhausted(self) -> bool:
+        return self.has_next_page is False or any(page.exhausted for page in self.pages)
 
 
 @dataclass(frozen=True)

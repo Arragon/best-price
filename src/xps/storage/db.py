@@ -17,7 +17,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 _BUSY_TIMEOUT_MS = 5000
 
@@ -85,6 +85,21 @@ def _migrate_additive(conn: sqlite3.Connection) -> list[str]:
                 " ADD COLUMN priced_count INTEGER NOT NULL DEFAULT 0"
             )
             applied.append("search_runs.priced_count")
+
+    run_columns = _column_names(conn, "search_runs")
+    if "request_fingerprint" not in run_columns:
+        conn.execute("ALTER TABLE search_runs ADD COLUMN request_fingerprint TEXT")
+        applied.append("search_runs.request_fingerprint")
+    if "exhausted" not in run_columns:
+        conn.execute(
+            "ALTER TABLE search_runs ADD COLUMN exhausted INTEGER NOT NULL DEFAULT 0"
+        )
+        applied.append("search_runs.exhausted")
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_runs_fingerprint "
+        "ON search_runs(request_fingerprint, started_at DESC)"
+    )
 
     return applied
 

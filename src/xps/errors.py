@@ -17,6 +17,16 @@ UPSTREAM_UNAVAILABLE = "UPSTREAM_UNAVAILABLE"
 DB_ERROR = "DB_ERROR"
 NO_VALID_RESULTS = "NO_VALID_RESULTS"
 RUN_INTERRUPTED = "RUN_INTERRUPTED"
+QUEUE_FULL = "QUEUE_FULL"
+AI_UNAVAILABLE = "AI_UNAVAILABLE"
+AI_INVALID_OUTPUT = "AI_INVALID_OUTPUT"
+INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
+SKU_MISMATCH = "SKU_MISMATCH"
+QUOTE_STALE = "QUOTE_STALE"
+RETAIL_NOT_CONFIGURED = "RETAIL_NOT_CONFIGURED"
+RETAIL_MOCK_REJECTED = "RETAIL_MOCK_REJECTED"
+RESEARCH_BUDGET_EXCEEDED = "RESEARCH_BUDGET_EXCEEDED"
+SCHEDULER_BLOCKED = "SCHEDULER_BLOCKED"
 
 ALL_CODES = frozenset(
     {
@@ -32,6 +42,10 @@ ALL_CODES = frozenset(
         DB_ERROR,
         NO_VALID_RESULTS,
         RUN_INTERRUPTED,
+        QUEUE_FULL,
+        AI_UNAVAILABLE, AI_INVALID_OUTPUT, INSUFFICIENT_EVIDENCE, SKU_MISMATCH,
+        QUOTE_STALE, RETAIL_NOT_CONFIGURED, RETAIL_MOCK_REJECTED,
+        RESEARCH_BUDGET_EXCEEDED, SCHEDULER_BLOCKED,
     }
 )
 
@@ -48,6 +62,16 @@ _HTTP_STATUS = {
     DB_ERROR: 500,
     NO_VALID_RESULTS: 200,
     RUN_INTERRUPTED: 200,
+    QUEUE_FULL: 429,
+    AI_UNAVAILABLE: 503,
+    AI_INVALID_OUTPUT: 502,
+    INSUFFICIENT_EVIDENCE: 422,
+    SKU_MISMATCH: 422,
+    QUOTE_STALE: 409,
+    RETAIL_NOT_CONFIGURED: 503,
+    RETAIL_MOCK_REJECTED: 422,
+    RESEARCH_BUDGET_EXCEEDED: 429,
+    SCHEDULER_BLOCKED: 409,
 }
 
 _RETRYABLE = {
@@ -63,6 +87,16 @@ _RETRYABLE = {
     DB_ERROR: True,
     NO_VALID_RESULTS: False,
     RUN_INTERRUPTED: False,
+    QUEUE_FULL: True,
+    AI_UNAVAILABLE: True,
+    AI_INVALID_OUTPUT: True,
+    INSUFFICIENT_EVIDENCE: False,
+    SKU_MISMATCH: False,
+    QUOTE_STALE: True,
+    RETAIL_NOT_CONFIGURED: False,
+    RETAIL_MOCK_REJECTED: False,
+    RESEARCH_BUDGET_EXCEEDED: False,
+    SCHEDULER_BLOCKED: False,
 }
 
 _REQUIRES_HUMAN = {
@@ -78,6 +112,16 @@ _REQUIRES_HUMAN = {
     DB_ERROR: False,
     NO_VALID_RESULTS: False,
     RUN_INTERRUPTED: False,
+    QUEUE_FULL: False,
+    AI_UNAVAILABLE: False,
+    AI_INVALID_OUTPUT: False,
+    INSUFFICIENT_EVIDENCE: False,
+    SKU_MISMATCH: False,
+    QUOTE_STALE: False,
+    RETAIL_NOT_CONFIGURED: True,
+    RETAIL_MOCK_REJECTED: False,
+    RESEARCH_BUDGET_EXCEEDED: False,
+    SCHEDULER_BLOCKED: True,
 }
 
 # 出现即必须停止自动操作，交还用户（指南 §9 失败策略）
@@ -110,6 +154,16 @@ AGENT_ACTIONS: dict[str, str] = {
     "还是给的是「面议 / 租金 / 区间」（ambiguous）。这不是被筛选掉的，"
     "本服务不做相关性筛选；考虑换关键词或用 /v1/products 读原文自行判断。",
     RUN_INTERRUPTED: "服务曾在本轮采集中途重启，该 run 已判定为中断。请重新发起搜索。",
+    QUEUE_FULL: "本地搜索队列已满，没有向平台发起新请求。请稍后重试，或复用已有 run。",
+    AI_UNAVAILABLE: "文本模型不可用；保留原始商品并使用规则结果，检查配置后再选择重试。",
+    AI_INVALID_OUTPUT: "文本模型输出未通过结构或证据校验；不要采用无证据标签。",
+    INSUFFICIENT_EVIDENCE: "关键证据不足；补充可核验字段或将结果保留在 Review。",
+    SKU_MISMATCH: "新品与二手 SKU/套装不匹配；并列展示差异，不计算确定价差。",
+    QUOTE_STALE: "报价已过新鲜期；刷新报价或明确标记 stale。",
+    RETAIL_NOT_CONFIGURED: "没有通过真实验证的自动零售适配器；可使用有来源的 Quote Import。",
+    RETAIL_MOCK_REJECTED: "Mock/Dry-run 报价被拒绝，不能写入正式新品报价。",
+    RESEARCH_BUDGET_EXCEEDED: "研究请求预算已耗尽；停止新增平台请求并报告研究范围。",
+    SCHEDULER_BLOCKED: "调度器处于冷却或人工处理状态；遵循 /help，不要绕过。",
 }
 
 

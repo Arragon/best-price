@@ -414,6 +414,71 @@ def test_query_happy_path_returns_report_and_exit_zero() -> None:
     assert "在售报价" in result.report
 
 
+def test_json_mode_fetches_every_product_page_with_full_descriptions() -> None:
+    items = [
+        {
+            **PRODUCTS_OK["items"][0],
+            "product_id": index,
+            "description": f"合成长描述 {index}",
+        }
+        for index in range(1, 151)
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/health":
+            return httpx.Response(200, json={"status": "ok", "database": "ok"})
+        if path == "/v1/auth/status":
+            return httpx.Response(200, json={"state": "guest", "requires_human_action": False})
+        if path == "/v1/search":
+            return httpx.Response(202, json={"run_id": RUN_ID, "status": "pending",
+                                            "status_url": f"/v1/search-runs/{RUN_ID}"})
+        if path == f"/v1/search-runs/{RUN_ID}":
+            return httpx.Response(200, json=RUN_OK)
+        if path == "/v1/stats":
+            return httpx.Response(200, json=STATS_OK)
+        if path == "/v1/products":
+            offset = int(request.url.params.get("offset", "0"))
+            limit = int(request.url.params.get("limit", "100"))
+            return httpx.Response(
+                200,
+                json={**PRODUCTS_OK, "items": items[offset : offset + limit], "total": len(items),
+                      "limit": limit, "offset": offset},
+            )
+        raise AssertionError(path)
+
+    with make_client(handler) as client:
+        result = query(client, keyword="富士 X-T4", poll_interval=0, fetch_all=True)
+
+    assert len(result.products) == 150
+    assert result.products[-1]["description"] == "合成长描述 150"
+
+
+def test_reuse_run_skips_search_submission() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        seen.append(path)
+        if path == "/health":
+            return httpx.Response(200, json={"status": "ok", "database": "ok"})
+        if path == "/v1/auth/status":
+            return httpx.Response(200, json={"state": "guest", "requires_human_action": False})
+        if path == f"/v1/search-runs/{RUN_ID}":
+            return httpx.Response(200, json=RUN_OK)
+        if path == "/v1/stats":
+            return httpx.Response(200, json=STATS_OK)
+        if path == "/v1/products":
+            return httpx.Response(200, json=PRODUCTS_OK)
+        raise AssertionError(path)
+
+    with make_client(handler) as client:
+        result = query(client, keyword="", reuse_run_id=RUN_ID, poll_interval=0)
+
+    assert result.exit_code == 0
+    assert "/v1/search" not in seen
+
+
 def test_query_stops_and_explains_when_the_run_failed() -> None:
     failed_run = {
         **RUN_OK,

@@ -7,8 +7,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Sequence
 
 import httpx
@@ -33,6 +35,16 @@ class QueryResult:
     report: str
     run: dict[str, Any] | None = None
     stats: dict[str, Any] | None = None
+    products: tuple[dict[str, Any], ...] = ()
+
+    def as_json(self) -> dict[str, Any]:
+        return {
+            "exit_code": self.exit_code,
+            "message": self.report,
+            "run": self.run,
+            "stats": self.stats,
+            "products": list(self.products),
+        }
 
 
 def _yuan(value: str | None) -> str:
@@ -234,6 +246,10 @@ def query(
     poll_interval: float = 2.0,
     timeout: float = 300.0,
     top: int = 5,
+    pace: str = "balanced",
+    cache_policy: str = "prefer_fresh",
+    reuse_run_id: str | None = None,
+    fetch_all: bool = False,
 ) -> QueryResult:
     try:
         health = client.get("/health")
@@ -247,23 +263,28 @@ def query(
     except (httpx.HTTPError, ValueError):
         auth = {}
 
-    payload: dict[str, Any] = {
-        "keyword": keyword,
-        "max_pages": max_pages,
-        "sort": sort,
-    }
-    if min_price is not None:
-        payload["min_price_yuan"] = str(min_price)
-    if max_price is not None:
-        payload["max_price_yuan"] = str(max_price)
+    if reuse_run_id:
+        run_id = reuse_run_id
+    else:
+        payload: dict[str, Any] = {
+            "keyword": keyword,
+            "max_pages": max_pages,
+            "sort": sort,
+            "pace": pace,
+            "cache_policy": cache_policy,
+        }
+        if min_price is not None:
+            payload["min_price_yuan"] = str(min_price)
+        if max_price is not None:
+            payload["max_price_yuan"] = str(max_price)
 
-    try:
-        accepted = client.post("/v1/search", json=payload)
-    except httpx.HTTPError as exc:
-        return QueryResult(EXIT_USAGE, _service_down_text(f"{type(exc).__name__}: {exc}"))
-    if accepted.status_code != 202:
-        return QueryResult(EXIT_USAGE, _error_text(accepted))
-    run_id = accepted.json()["run_id"]
+        try:
+            accepted = client.post("/v1/search", json=payload)
+        except httpx.HTTPError as exc:
+            return QueryResult(EXIT_USAGE, _service_down_text(f"{type(exc).__name__}: {exc}"))
+        if accepted.status_code != 202:
+            return QueryResult(EXIT_USAGE, _error_text(accepted))
+        run_id = accepted.json()["run_id"]
 
     deadline = time.monotonic() + timeout
     run: dict[str, Any] = {}
@@ -283,10 +304,24 @@ def query(
 
     try:
         stats = client.get("/v1/stats", params={"run_id": run_id}).json()
-        products = client.get(
-            "/v1/products",
-            params={"run_id": run_id, "priced_only": True, "limit": top},
-        ).json()
+        page_limit = 100 if fetch_all else max(1, min(top, 100))
+        product_items: list[dict[str, Any]] = []
+        offset = 0
+        while True:
+            products = client.get(
+                "/v1/products",
+                params={
+                    "run_id": run_id,
+                    "priced_only": False if fetch_all else True,
+                    "limit": page_limit,
+                    "offset": offset,
+                },
+            ).json()
+            items = products.get("items") or []
+            product_items.extend(items)
+            offset += len(items)
+            if not fetch_all or not items or offset >= int(products.get("total") or 0):
+                break
     except (httpx.HTTPError, ValueError) as exc:
         return QueryResult(EXIT_USAGE, _service_down_text(f"取结果失败：{exc}"), run=run)
 
@@ -295,9 +330,15 @@ def query(
         header += "（本地凭证，未向平台主动校验）"
 
     body = render_report(
-        run=run, stats=stats, products=products.get("items") or [], top=top
+        run=run, stats=stats, products=product_items, top=top
     )
-    return QueryResult(EXIT_OK, f"{header}\n\n{body}", run=run, stats=stats)
+    return QueryResult(
+        EXIT_OK,
+        f"{header}\n\n{body}",
+        run=run,
+        stats=stats,
+        products=tuple(product_items),
+    )
 
 
 def build_client(base_url: str, timeout: float = 60.0) -> httpx.Client:
@@ -316,7 +357,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="闲鱼在售报价一键查询（POST → poll → stats → products）",
         epilog="退出码：0 成功 / 2 服务或参数问题 / 3 采集失败 / 4 轮询超时",
     )
-    parser.add_argument("keyword", help="搜索关键词，如「富士 X-T4」「RTX 4090」")
+    parser.add_argument("keyword", nargs="?", help="搜索关键词，如「富士 X-T4」「RTX 4090」")
     parser.add_argument("--pages", type=int, default=1, help="抓取页数，默认 1")
     parser.add_argument("--sort", default="newest", choices=SORT_OPTIONS)
     parser.add_argument("--min-price", help="最低价（元）")
@@ -325,12 +366,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=300.0, help="轮询总超时秒数")
     parser.add_argument("--poll-interval", type=float, default=2.0)
     parser.add_argument("--top", type=int, default=5, help="列出最低 N 件样本")
+    parser.add_argument("--pace", choices=("economy", "balanced", "fast"), default="balanced")
+    parser.add_argument(
+        "--force-refresh",
+        action="store_true",
+        help="跳过近期结果缓存；仍受全局节流和风控停止状态约束",
+    )
+    parser.add_argument("--reuse-run", metavar="RUN_ID", help="复用已有 run，跳过 POST")
+    parser.add_argument("--format", choices=("text", "json"), default="text")
+    parser.add_argument("--output", type=Path, help="把输出写入文件；JSON 模式包含全量分页商品")
     args = parser.parse_args(argv)
+
+    if not args.keyword and not args.reuse_run:
+        parser.error("必须提供 keyword，或使用 --reuse-run RUN_ID")
 
     with build_client(args.base_url) as client:
         result = query(
             client,
-            keyword=args.keyword,
+            keyword=args.keyword or "",
             max_pages=args.pages,
             sort=args.sort,
             min_price=args.min_price,
@@ -338,8 +391,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             poll_interval=args.poll_interval,
             timeout=args.timeout,
             top=args.top,
+            pace=args.pace,
+            cache_policy="force_refresh" if args.force_refresh else "prefer_fresh",
+            reuse_run_id=args.reuse_run,
+            fetch_all=args.format == "json",
         )
-    print(result.report)
+    rendered = (
+        json.dumps(result.as_json(), ensure_ascii=False, indent=2)
+        if args.format == "json"
+        else result.report
+    )
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(rendered + "\n", encoding="utf-8")
+    else:
+        print(rendered)
     return result.exit_code
 
 

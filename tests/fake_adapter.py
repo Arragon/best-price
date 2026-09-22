@@ -81,6 +81,7 @@ class FakeAdapter:
     verified_empty: bool = False
     delay: float = 0.0
     auth_error: Exception | None = None
+    exhaust_after_page: int | None = None
 
     calls: list[dict] = field(default_factory=list)
     active: int = 0
@@ -115,6 +116,11 @@ class FakeAdapter:
             outcomes: list[PageOutcome] = []
             warnings: list[str] = []
             for page in range(1, max_pages + 1):
+                if self.exhaust_after_page is not None and page > self.exhaust_after_page:
+                    outcomes.append(
+                        PageOutcome(page, False, (), outcome_kind="exhausted")
+                    )
+                    break
                 error = self.page_errors.get(page)
                 if error:
                     outcomes.append(PageOutcome(page, False, (), error, "合成失败"))
@@ -130,7 +136,11 @@ class FakeAdapter:
                 pages_requested=max_pages,
                 pages=tuple(outcomes),
                 warnings=tuple(warnings),
-                has_next_page=len(self.pages) > max_pages,
+                has_next_page=(
+                    False
+                    if self.exhaust_after_page is not None
+                    else len(self.pages) > max_pages
+                ),
             )
         finally:
             self.active -= 1

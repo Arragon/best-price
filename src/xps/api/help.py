@@ -59,10 +59,19 @@ _CALL_FLOW = (
     },
 )
 
+_RESEARCH_FLOW = (
+    "POST /v1/researches 创建带预算和来源化约束的研究",
+    "POST /v1/researches/{id}/runs 显式关联已完成的 search run",
+    "POST /v1/text-analyses 提取可定位的文本证据",
+    "POST /v1/evaluations 写入版本化挂牌评估",
+    "GET /v1/researches/{id}/comparable-stats 读取同 SKU 去重统计",
+    "GET /v1/researches/{id}/ranked 读取型号层与挂牌层分桶报告",
+)
+
 _STATUS_VALUES = {
     "pending": "已入库，排队中（单实例串行，可能因节流而等待）",
     "running": "正在采集",
-    "succeeded": "请求的页全部抓到；结果可用",
+    "succeeded": "结果可用；可能抓满请求页，也可能因平台正常末页 exhausted 提前结束",
     "partial": "只抓到部分页；结果可用但样本不完整，必须转述 partial_pages",
     "failed": "采集失败。**不等于**平台没有商品；/v1/products 与 /v1/stats 会直接报错",
     "blocked_login": "需要登录才能继续；请用户本人完成登录后重试",
@@ -178,9 +187,12 @@ def build_help(app: Any, settings: Settings) -> dict[str, Any]:
         "service": _SERVICE_NAME,
         "version": __version__,
         "purpose": (
-            "在本地对闲鱼做真实搜索，把商品去重入库，然后**原样透出**平台给出的字段"
+            "在本地对闲鱼做真实搜索，把商品去重入库并**原样透出**平台字段；"
+            "另提供有预算的购买研究、证据约束文本分析、可复现挂牌评估、"
+            "同 SKU 可比统计与可审计新品报价导入。"
+            "原始层包括"
             "（完整描述、卖家信用、好评率、地址、想要人数、券抵扣、拍卖/广告标记、主图）"
-            "与价格解析结果。本服务不做相关性筛选——哪条商品可比由调用方判断。"
+            "与价格解析结果。本服务不在原始层做相关性筛选。"
             "另给出未筛选的算术分布（中位数/分位数）。单平台 MVP，只监听 127.0.0.1。"
         ),
         "price_semantics": {
@@ -199,15 +211,18 @@ def build_help(app: Any, settings: Settings) -> dict[str, Any]:
             "null_means": "字段缺失就是 null，服务不会填「暂无」之类的占位值",
         },
         "one_shot_client": (
-            'scripts/query-price.sh "富士 X-T4" --pages 2'
-            "  —— 已封装四步调用、超时、错误分诊与转述纪律；有 shell 权限时优先用它"
+            'scripts/query-price.sh "富士 X-T4" --pages 2 --format json --output result.json'
+            "  —— JSON 会遍历本地分页并保留完整描述；有 shell 权限时优先用它"
         ),
         "call_flow": list(_CALL_FLOW),
+        "research_flow": list(_RESEARCH_FLOW),
         "endpoints": _endpoints(spec),
         "search_request": {
             "content_type": "application/json",
             "fields": list(SearchSubmitRequest.model_fields),
             "sort_values": ["newest", "price_asc", "price_desc", "default"],
+            "pace_values": ["economy", "balanced", "fast"],
+            "cache_policy_values": ["prefer_fresh", "force_refresh"],
             "unsupported_filters": list(UNVERIFIED_FILTERS),
             "unsupported_reason": (
                 "上游 SearchFilters 支持这些参数，但平台是否真按其过滤**未经实测验证**。"
@@ -228,6 +243,10 @@ def build_help(app: Any, settings: Settings) -> dict[str, Any]:
             "min_sample_threshold": settings.min_sample_threshold,
             "min_seconds_between_searches": settings.min_seconds_between_searches,
             "max_concurrent_searches": settings.max_concurrent_searches,
+            "max_pending_jobs": settings.max_pending_jobs,
+            "search_cache_ttl_seconds": settings.search_cache_ttl_seconds,
+            "platform_floor_seconds": settings.platform_floor_seconds,
+            "allow_faster_pace": settings.allow_faster_pace,
         },
         "status_values": dict(_STATUS_VALUES),
         "error_codes": {
@@ -257,6 +276,10 @@ def build_help(app: Any, settings: Settings) -> dict[str, Any]:
                 "服务重启会把遗留的 pending/running 判为 failed + RUN_INTERRUPTED，"
                 "不会永远挂在 running。"
             ),
+            "exhausted_means": (
+                "平台明确报告没有下一页，是正常完成而不是 partial；"
+                "search run 返回 exhausted=true 与实际 pages_fetched。"
+            ),
         },
         "must_report": list(_MUST_REPORT),
         "must_not": list(_MUST_NOT),
@@ -275,6 +298,8 @@ def build_help(app: Any, settings: Settings) -> dict[str, Any]:
             "README.md",
             "IMPLEMENTATION_REPORT.md",
             "docs/superpowers/specs/2026-09-22-xianyu-price-service-design.md",
+            ".agents/skills/best-price/SKILL.md",
+            "docs/optimization/external-gates.md",
         ],
     }
 
@@ -298,6 +323,8 @@ def render_help_text(payload: dict[str, Any]) -> str:
     ]
     for index, step in enumerate(payload["call_flow"], start=1):
         lines.append(f"  {index}. {step['method']} {step['path']} —— {step['purpose']}")
+    lines += ["", "【购买研究流程】"]
+    lines += [f"  {index}. {step}" for index, step in enumerate(payload["research_flow"], start=1)]
 
     lines += ["", "【端点】"]
     for entry in payload["endpoints"]:
@@ -320,6 +347,8 @@ def render_help_text(payload: dict[str, Any]) -> str:
         "【POST /v1/search 请求体】",
         "  字段: " + ", ".join(request["fields"]),
         f"  sort: {' | '.join(request['sort_values'])}",
+        f"  pace: {' | '.join(request['pace_values'])}",
+        f"  cache_policy: {' | '.join(request['cache_policy_values'])}",
         "  暂不支持: " + ", ".join(request["unsupported_filters"]),
         f"    原因: {request['unsupported_reason']}",
         f"  筛选: {request['no_relevance_filters']}",

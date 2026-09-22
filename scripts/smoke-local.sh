@@ -40,6 +40,9 @@ echo "== 服务地址 $BASE =="
 HEALTH="$(curl -fsS "$BASE/health")"
 echo "health      : $HEALTH"
 
+CAPABILITIES="$(curl -fsS "$BASE/v1/capabilities")"
+echo "capabilities: $CAPABILITIES"
+
 AUTH="$(curl -fsS "$BASE/v1/auth/status")"
 echo "auth/status : $AUTH"
 

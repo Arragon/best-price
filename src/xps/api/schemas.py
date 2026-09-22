@@ -11,6 +11,8 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 SortOption = Literal["newest", "price_asc", "price_desc", "default"]
+PaceOption = Literal["economy", "balanced", "fast"]
+CachePolicy = Literal["prefer_fresh", "force_refresh"]
 
 KEYWORD_MAX_LENGTH = 64
 PRODUCTS_DEFAULT_LIMIT = 50
@@ -30,6 +32,9 @@ class SearchSubmitRequest(BaseModel):
     sort: SortOption = "newest"
     min_price_yuan: Decimal | None = Field(default=None, ge=0)
     max_price_yuan: Decimal | None = Field(default=None, ge=0)
+    pace: PaceOption = "balanced"
+    cache_policy: CachePolicy = "prefer_fresh"
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=128)
 
     # 上游 SearchFilters 支持这三项，但平台是否真过滤**未经实测验证**，
     # 故声明出来只为给出明确的 UNSUPPORTED_FILTER，而不是静默忽略。
@@ -63,6 +68,8 @@ class SearchAccepted(BaseModel):
     run_id: str
     status: str
     status_url: str
+    reused: bool = False
+    cache_hit: bool = False
 
 
 class RunError(BaseModel):
@@ -91,6 +98,8 @@ class SearchRunResponse(BaseModel):
     # 采集来源可追溯：事后能判断这轮数据是哪个适配器/上游版本抓的
     adapter_version: str | None = None
     source_commit: str | None = None
+    exhausted: bool = False
+    request_fingerprint: str | None = None
 
 
 class SellerInfo(BaseModel):

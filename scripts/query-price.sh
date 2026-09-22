@@ -5,6 +5,9 @@
 #   scripts/query-price.sh "富士 X-T4"                       # 默认 1 页
 #   scripts/query-price.sh "RTX 4090" --pages 2              # 任意品类，同一套用法
 #   scripts/query-price.sh "9950X3D" --min-price 2000
+#   scripts/query-price.sh "富士 X-T4" --format json --output out.json
+#   scripts/query-price.sh "富士 X-T4" --reuse-run <run_id>   # 不访问平台
+#   scripts/query-price.sh "富士 X-T4" --pace economy         # 任务级节奏
 #
 # 本服务不做相关性筛选：租赁盘、拍卖、配件、广告位都会照常返回，
 # 由调用方读 /v1/products 的原始字段（完整描述、卖家信用、平台标记）自行判断。

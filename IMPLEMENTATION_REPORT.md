@@ -5,6 +5,36 @@
 
 ---
 
+## 2026-09-23 优化 Phase 0–6：购买研究闭环
+
+状态：`IMPLEMENTED` + `TESTED_WITH_FIXTURE`；真实平台为 `BLOCKED_EXTERNAL`。
+
+- 基线、数据库备份与能力边界记录在 `docs/optimization/baseline.md`。
+- 正常末页使用独立 `exhausted` 状态，不再作为失败页导致 `partial`。
+- 规范化请求指纹支持运行中合并与近期成功 run 复用；`force_refresh` 只跳过结果缓存。
+- `MAX_PENDING_JOBS` 提供有界队列；满载返回 `QUEUE_FULL` 且不调用适配器。
+- `scheduler_state` 持久化最后平台尝试、限流冷却和人工处理停止状态。
+- 任务级 `pace` 默认兼容旧 `MIN_SECONDS_BETWEEN_SEARCHES`；只有显式
+  `ALLOW_FASTER_PACE=true` 后，fast 才能在平台硬下限以上缩短等待。
+- CLI 增加全量分页 JSON、`--output`、`--reuse-run`、pace 与强刷选项；默认 text 保持兼容。
+- 新 Skill 位于 `.agents/skills/best-price/`；旧 `price-parser` 暂留兼容指针。
+- SQLite schema 增量升级至 v4，原始 observations 与 `/v1/stats` 未筛选语义不变。
+- Phase 2：SearchProfile、请求预算、run 关联、动态型号候选、型号层/挂牌层分离。
+- Phase 3：规则基线、可选 OpenAI-compatible 模型、文本 hash 缓存和原文证据校验。
+- Phase 4：确定性五维评分、风险/证据/反馈、同 SKU 跨 run 去重可比统计。
+- Phase 5：可审计 Quote Import、Mock 拒绝、URL/平台校验、SKU 匹配和完整成本价差。
+- Phase 6：capabilities、结构化 ranked 输出、Skill/README/OpenAPI 与外部闸门文档。
+
+当前真实访问只得到一次 `AUTH_EXPIRED`（0 页、0 商品、未重试），所以没有把 fixture
+结果写成 live 结论；详情见基线文档。
+
+最终离线闸门：`.venv/bin/python -m pytest -q` → `452 passed, 4 deselected`；v2 真实备份
+副本连续执行 v4 迁移两次，`integrity_check=ok`，10 个 run、422 个 product、509 个
+observation 行数不变。阶段与外部门禁矩阵见 `docs/optimization/status.md`；零售候选的
+commit、许可、依赖与运行闸门见 `docs/optimization/retail-adapter-audit.md`。
+
+---
+
 ## ⚠️ 2026-09-22 架构改造：移除相关性分类筛选层
 
 **本节是最新事实，优先级高于下文所有历史章节。** 下文中描述规则分类器（`classify.py`）、

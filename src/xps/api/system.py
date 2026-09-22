@@ -71,4 +71,6 @@ async def auth_status(request: Request) -> AuthStatusResponse:
     ),
 )
 async def reload_auth(request: Request) -> AuthStatusResponse:
-    return _to_response(await request.app.state.adapter.reload())
+    status = await request.app.state.adapter.reload()
+    request.app.state.service.scheduler.acknowledge_human_action()
+    return _to_response(status)

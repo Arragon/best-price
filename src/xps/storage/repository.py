@@ -72,6 +72,8 @@ class RunRecord:
     warnings: tuple[str, ...]
     adapter_version: str | None
     source_commit: str | None
+    request_fingerprint: str | None
+    exhausted: bool
 
 
 @dataclass(frozen=True)
@@ -158,6 +160,8 @@ def _run_record(row: sqlite3.Row) -> RunRecord:
         warnings=_loads_tuple(row["warnings_json"]),
         adapter_version=row["adapter_version"],
         source_commit=row["source_commit"],
+        request_fingerprint=row["request_fingerprint"],
+        exhausted=bool(row["exhausted"]),
     )
 
 
@@ -265,13 +269,14 @@ class Repository:
         adapter_version: str | None = None,
         source_commit: str | None = None,
         started_at: str | None = None,
+        request_fingerprint: str | None = None,
     ) -> None:
         with self.conn:
             self.conn.execute(
                 """INSERT INTO search_runs
                        (id, platform, keyword, filters_json, status, started_at,
-                        pages_requested, adapter_version, source_commit)
-                   VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)""",
+                        pages_requested, adapter_version, source_commit, request_fingerprint)
+                   VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)""",
                 (
                     run_id,
                     platform,
@@ -281,6 +286,7 @@ class Repository:
                     pages_requested,
                     adapter_version,
                     source_commit,
+                    request_fingerprint,
                 ),
             )
 
@@ -304,13 +310,14 @@ class Repository:
         error_message: str | None = None,
         warnings: Sequence[str] = (),
         ended_at: str | None = None,
+        exhausted: bool = False,
     ) -> None:
         with self.conn:
             self.conn.execute(
                 """UPDATE search_runs
                       SET status=?, ended_at=?, auth_mode=?, pages_fetched=?,
                           raw_count=?, stored_count=?, priced_count=?,
-                          error_code=?, error_message=?, warnings_json=?
+                          error_code=?, error_message=?, warnings_json=?, exhausted=?
                     WHERE id=?""",
                 (
                     status,
@@ -323,6 +330,7 @@ class Repository:
                     error_code,
                     error_message,
                     json.dumps(list(warnings), ensure_ascii=False),
+                    int(exhausted),
                     run_id,
                 ),
             )
@@ -330,6 +338,59 @@ class Repository:
     def get_run(self, run_id: str) -> RunRecord | None:
         row = self.conn.execute("SELECT * FROM search_runs WHERE id=?", (run_id,)).fetchone()
         return _run_record(row) if row else None
+
+    def find_active_run(self, request_fingerprint: str) -> RunRecord | None:
+        row = self.conn.execute(
+            """SELECT * FROM search_runs
+                 WHERE request_fingerprint=? AND status IN ('pending','running')
+              ORDER BY started_at DESC LIMIT 1""",
+            (request_fingerprint,),
+        ).fetchone()
+        return _run_record(row) if row else None
+
+    def find_reusable_run(self, request_fingerprint: str, not_before: str) -> RunRecord | None:
+        row = self.conn.execute(
+            """SELECT * FROM search_runs
+                 WHERE request_fingerprint=? AND status='succeeded' AND ended_at>=?
+              ORDER BY ended_at DESC LIMIT 1""",
+            (request_fingerprint, not_before),
+        ).fetchone()
+        return _run_record(row) if row else None
+
+    def count_active_runs(self) -> int:
+        placeholders = ",".join("?" for _ in _ACTIVE_STATUSES)
+        return int(
+            self.conn.execute(
+                f"SELECT COUNT(*) FROM search_runs WHERE status IN ({placeholders})",
+                _ACTIVE_STATUSES,
+            ).fetchone()[0]
+        )
+
+    # -- scheduler state ---------------------------------------------------
+
+    def get_scheduler_state(self, key: str) -> str | None:
+        row = self.conn.execute(
+            "SELECT value FROM scheduler_state WHERE key=?", (key,)
+        ).fetchone()
+        return str(row["value"]) if row else None
+
+    def set_scheduler_state(self, key: str, value: str) -> None:
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO scheduler_state(key, value, updated_at) VALUES (?, ?, ?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value,
+                                                  updated_at=excluded.updated_at""",
+                (key, value, utcnow_iso()),
+            )
+
+    def delete_scheduler_state(self, *keys: str) -> None:
+        if not keys:
+            return
+        placeholders = ",".join("?" for _ in keys)
+        with self.conn:
+            self.conn.execute(
+                f"DELETE FROM scheduler_state WHERE key IN ({placeholders})", keys
+            )
 
     def recover_interrupted_runs(self) -> int:
         """启动时调用：进程崩溃遗留的 pending/running 一律改判 failed + RUN_INTERRUPTED。"""

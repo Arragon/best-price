@@ -52,6 +52,11 @@ def build_client(tmp_path, adapter: FakeAdapter, **overrides) -> TestClient:
         "database_path": tmp_path / "price.sqlite3",
         "min_seconds_between_searches": 0,
         "seconds_between_pages": 0,
+        "platform_floor_seconds": 0,
+        "economy_gap_seconds": 0,
+        "balanced_gap_seconds": 0,
+        "fast_gap_seconds": 0,
+        "allow_faster_pace": True,
         "_env_file": None,
     }
     options.update(overrides)

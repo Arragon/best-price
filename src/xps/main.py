@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from contextlib import asynccontextmanager
+from logging.handlers import RotatingFileHandler
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -15,8 +16,18 @@ from fastapi.responses import JSONResponse
 
 from xps import __version__
 from xps.adapters.xianyu import XianyuUpstreamAdapter
+from xps.api import (
+    capabilities,
+    evaluations,
+    products,
+    research,
+    retail_prices,
+    search,
+    stats,
+    system,
+    text_analysis,
+)
 from xps.api import help as help_api
-from xps.api import products, search, stats, system
 from xps.errors import DB_ERROR, INVALID_QUERY, ServiceError, is_retryable, requires_human
 from xps.services.search_service import SearchService
 from xps.settings import Settings
@@ -31,7 +42,7 @@ APP_DESCRIPTION = """
 
 ## 这个服务做什么
 
-对闲鱼做一次真实关键词搜索，去重入库，然后把平台给出的字段**原样透出**：
+    对闲鱼做真实关键词搜索，去重入库，然后把平台给出的字段**原样透出**：
 完整挂牌描述、卖家信用与好评率、地址、想要人数、券抵扣、拍卖/广告标记、主图、
 可点开的原始链接，外加价格解析结果。**不做相关性筛选** —— 哪条商品可比由调用方判断。
 
@@ -40,7 +51,10 @@ APP_DESCRIPTION = """
 返回的是**采集时刻的公开在售报价**，不是成交价，不含国补 / 优惠券 / 议价结果。
 金额内部一律以人民币**分（整数）**存储，API 以保留两位的字符串返回。
 `/v1/stats` 的分布是**未筛选**的：租赁盘、拍卖起拍价、配件、广告位都在样本里，
-`sample_quality` 恒含 `unfiltered`。
+    `sample_quality` 恒含 `unfiltered`。
+
+    购买研究、文本分析、挂牌评估、可比统计和新品 Quote Import 是独立派生层；
+    不会改写 observations，也不会改变原始 `/v1/stats` 的未筛选语义。
 
 ## 调用流程
 
@@ -57,7 +71,18 @@ APP_DESCRIPTION = """
 不要继续自动重试。
 """
 
-_Routers = (help_api, search, products, stats, system)
+_Routers = (
+    help_api,
+    search,
+    products,
+    stats,
+    system,
+    research,
+    text_analysis,
+    evaluations,
+    retail_prices,
+    capabilities,
+)
 
 
 @asynccontextmanager
@@ -146,14 +171,34 @@ def create_app(settings: Settings | None = None, *, adapter: object | None = Non
     return app
 
 
+def configure_logging(settings: Settings) -> None:
+    """Configure console output plus bounded local log retention."""
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if settings.log_file is not None:
+        settings.log_file.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(
+            RotatingFileHandler(
+                settings.log_file,
+                maxBytes=settings.log_max_bytes,
+                backupCount=settings.log_backup_count,
+                encoding="utf-8",
+            )
+        )
+    for handler in handlers:
+        handler.setFormatter(formatter)
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        handlers=handlers,
+        force=True,
+    )
+
+
 def main() -> None:
     import uvicorn
 
     settings = Settings()
-    logging.basicConfig(
-        level=settings.log_level.upper(),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    configure_logging(settings)
     logger.info(
         "启动 %s v%s，监听 http://%s:%d，数据库 %s",
         APP_TITLE,
@@ -167,6 +212,7 @@ def main() -> None:
         host=settings.app_host,
         port=settings.app_port,
         log_level=settings.log_level.lower(),
+        log_config=None,
     )
 
 

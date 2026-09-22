@@ -1,0 +1,14 @@
+{
+  "mode": "category_research",
+  "category": "drone",
+  "goal": "旅游航拍、便携、接受二手",
+  "currency": "CNY",
+  "target_budget_fen": 300000,
+  "hard_budget_fen": null,
+  "required": [{"value": "拍摄功能正常", "source": "user_explicit"}],
+  "preferred": [{"value": "便携", "source": "user_explicit"}],
+  "allow_alternative_models": true,
+  "allow_extra": true,
+  "research_budget": {"max_xianyu_requests": 8, "max_pages_per_query": 2},
+  "pace": "balanced"
+}

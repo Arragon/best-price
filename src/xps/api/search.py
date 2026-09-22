@@ -44,7 +44,7 @@ async def submit_search(
             f"以下筛选条件尚未实测验证平台是否真过滤，暂不开放：{', '.join(unverified)}",
         )
 
-    run_id = service.submit(
+    submission = await service.submit(
         SearchRequest(
             keyword=payload.keyword,
             max_pages=payload.max_pages,
@@ -52,10 +52,17 @@ async def submit_search(
             min_price=payload.min_price_yuan,
             max_price=payload.max_price_yuan,
             city=payload.city,
+            pace=payload.pace,
+            cache_policy=payload.cache_policy,
+            idempotency_key=payload.idempotency_key,
         )
     )
     return SearchAccepted(
-        run_id=run_id, status="pending", status_url=f"/v1/search-runs/{run_id}"
+        run_id=submission.run_id,
+        status=submission.status,
+        status_url=f"/v1/search-runs/{submission.run_id}",
+        reused=submission.reused,
+        cache_hit=submission.cache_hit,
     )
 
 
@@ -86,4 +93,6 @@ async def get_search_run(
         error=run_error_body(run),  # type: ignore[arg-type]
         adapter_version=run.adapter_version,
         source_commit=run.source_commit,
+        exhausted=run.exhausted,
+        request_fingerprint=run.request_fingerprint,
     )

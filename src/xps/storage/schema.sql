@@ -36,7 +36,180 @@ CREATE TABLE IF NOT EXISTS search_runs (
     error_message    TEXT,
     warnings_json    TEXT NOT NULL DEFAULT '[]',
     adapter_version  TEXT,
-    source_commit    TEXT
+    source_commit    TEXT,
+    request_fingerprint TEXT,
+    exhausted        INTEGER NOT NULL DEFAULT 0 CHECK (exhausted IN (0,1))
+);
+
+CREATE TABLE IF NOT EXISTS scheduler_state (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS researches (
+    id                    TEXT PRIMARY KEY,
+    mode                  TEXT NOT NULL CHECK (mode IN ('model_search','category_research','listing_check')),
+    status                TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','complete','blocked')),
+    category              TEXT,
+    goal                  TEXT NOT NULL,
+    currency              TEXT NOT NULL DEFAULT 'CNY',
+    target_budget_fen     INTEGER CHECK (target_budget_fen IS NULL OR target_budget_fen >= 0),
+    hard_budget_fen       INTEGER CHECK (hard_budget_fen IS NULL OR hard_budget_fen >= 0),
+    allow_alternatives    INTEGER NOT NULL DEFAULT 1 CHECK (allow_alternatives IN (0,1)),
+    allow_extra           INTEGER NOT NULL DEFAULT 1 CHECK (allow_extra IN (0,1)),
+    max_xianyu_requests   INTEGER NOT NULL CHECK (max_xianyu_requests >= 0),
+    used_xianyu_requests  INTEGER NOT NULL DEFAULT 0 CHECK (used_xianyu_requests >= 0),
+    pace                  TEXT NOT NULL DEFAULT 'balanced' CHECK (pace IN ('economy','balanced','fast')),
+    stopping_reason       TEXT,
+    created_at            TEXT NOT NULL,
+    updated_at            TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS search_profiles (
+    id               TEXT PRIMARY KEY,
+    research_id      TEXT NOT NULL REFERENCES researches(id) ON DELETE CASCADE,
+    profile_version  INTEGER NOT NULL,
+    profile_json     TEXT NOT NULL,
+    created_at       TEXT NOT NULL,
+    UNIQUE(research_id, profile_version)
+);
+
+CREATE TABLE IF NOT EXISTS research_runs (
+    research_id  TEXT NOT NULL REFERENCES researches(id) ON DELETE CASCADE,
+    run_id       TEXT NOT NULL REFERENCES search_runs(id) ON DELETE RESTRICT,
+    purpose      TEXT NOT NULL DEFAULT 'focused' CHECK (purpose IN ('discovery','focused','listing_check')),
+    linked_at    TEXT NOT NULL,
+    PRIMARY KEY(research_id, run_id)
+);
+
+CREATE TABLE IF NOT EXISTS model_candidates (
+    research_id      TEXT NOT NULL REFERENCES researches(id) ON DELETE CASCADE,
+    canonical_model  TEXT NOT NULL,
+    variant           TEXT NOT NULL DEFAULT '',
+    bucket            TEXT NOT NULL CHECK (bucket IN ('primary','extra','review','excluded')),
+    source_kind       TEXT NOT NULL CHECK (source_kind IN ('user_explicit','agent_proposed','market_discovered')),
+    source_ref        TEXT,
+    reason            TEXT NOT NULL,
+    deviation         TEXT,
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL,
+    PRIMARY KEY(research_id, canonical_model, variant)
+);
+
+CREATE TABLE IF NOT EXISTS model_evaluations (
+    id               TEXT PRIMARY KEY,
+    research_id      TEXT NOT NULL REFERENCES researches(id) ON DELETE CASCADE,
+    canonical_model  TEXT NOT NULL,
+    verdict          TEXT NOT NULL CHECK (verdict IN ('primary','extra','review','excluded')),
+    fit_score        INTEGER CHECK (fit_score IS NULL OR (fit_score >= 0 AND fit_score <= 100)),
+    evidence_json    TEXT NOT NULL DEFAULT '[]',
+    source_summary   TEXT NOT NULL,
+    created_at       TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS text_analyses (
+    id                 TEXT PRIMARY KEY,
+    observation_id     INTEGER NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+    text_hash           TEXT NOT NULL,
+    model_id            TEXT NOT NULL,
+    prompt_version      TEXT NOT NULL,
+    schema_version      TEXT NOT NULL,
+    analysis_status     TEXT NOT NULL CHECK (analysis_status IN ('rules_only','succeeded','unavailable','invalid_output')),
+    result_json         TEXT NOT NULL,
+    error_code          TEXT,
+    created_at          TEXT NOT NULL,
+    UNIQUE(observation_id, text_hash, model_id, prompt_version, schema_version)
+);
+
+CREATE TABLE IF NOT EXISTS evaluations (
+    id                  TEXT PRIMARY KEY,
+    research_id         TEXT NOT NULL REFERENCES researches(id) ON DELETE CASCADE,
+    profile_id          TEXT NOT NULL REFERENCES search_profiles(id) ON DELETE RESTRICT,
+    product_id          INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    sku_key             TEXT,
+    eligibility         TEXT NOT NULL CHECK (eligibility IN ('eligible','extra','review','excluded')),
+    price_comparable    INTEGER NOT NULL DEFAULT 0 CHECK (price_comparable IN (0,1)),
+    score               INTEGER CHECK (score IS NULL OR (score >= 0 AND score <= 100)),
+    score_status        TEXT NOT NULL CHECK (score_status IN ('final','provisional','insufficient_data','not_applicable')),
+    subscores_json      TEXT NOT NULL DEFAULT '{}',
+    evidence_coverage   INTEGER NOT NULL CHECK (evidence_coverage >= 0 AND evidence_coverage <= 100),
+    rule_version        TEXT NOT NULL,
+    text_analysis_id    TEXT REFERENCES text_analyses(id) ON DELETE SET NULL,
+    created_at          TEXT NOT NULL,
+    UNIQUE(research_id, profile_id, product_id, rule_version)
+);
+
+CREATE TABLE IF NOT EXISTS evaluation_evidence (
+    evaluation_id   TEXT NOT NULL REFERENCES evaluations(id) ON DELETE CASCADE,
+    evidence_seq    INTEGER NOT NULL,
+    code            TEXT NOT NULL,
+    source_field    TEXT NOT NULL,
+    evidence_text   TEXT NOT NULL,
+    start_offset    INTEGER,
+    end_offset      INTEGER,
+    verified        INTEGER NOT NULL CHECK (verified IN (0,1)),
+    PRIMARY KEY(evaluation_id, evidence_seq)
+);
+
+CREATE TABLE IF NOT EXISTS risk_flags (
+    id                INTEGER PRIMARY KEY,
+    evaluation_id     TEXT NOT NULL REFERENCES evaluations(id) ON DELETE CASCADE,
+    code              TEXT NOT NULL,
+    severity          TEXT NOT NULL CHECK (severity IN ('info','warning','critical')),
+    effect            TEXT NOT NULL CHECK (effect IN ('exclude_from_price','suspend_score','limit_recommendation','inform_only')),
+    requires_review   INTEGER NOT NULL CHECK (requires_review IN (0,1)),
+    evidence_seq      INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS retail_price_runs (
+    id             TEXT PRIMARY KEY,
+    source_kind    TEXT NOT NULL,
+    status         TEXT NOT NULL CHECK (status IN ('succeeded','partial','failed')),
+    error_code     TEXT,
+    created_at     TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS new_price_quotes (
+    id                     TEXT PRIMARY KEY,
+    retail_run_id          TEXT NOT NULL REFERENCES retail_price_runs(id) ON DELETE CASCADE,
+    platform               TEXT NOT NULL CHECK (platform IN ('jd','taobao','tmall','pdd')),
+    source_kind            TEXT NOT NULL CHECK (source_kind IN ('official_api','api_verified','browser_observed','agent_submitted','manual_user')),
+    external_listing_id    TEXT,
+    canonical_product_url  TEXT NOT NULL,
+    sku_key                TEXT NOT NULL,
+    brand                  TEXT,
+    model                  TEXT NOT NULL,
+    variant                TEXT,
+    bundle_json            TEXT NOT NULL DEFAULT '[]',
+    listed_price_fen       INTEGER CHECK (listed_price_fen IS NULL OR listed_price_fen >= 0),
+    payable_price_fen      INTEGER CHECK (payable_price_fen IS NULL OR payable_price_fen >= 0),
+    shipping_price_fen     INTEGER CHECK (shipping_price_fen IS NULL OR shipping_price_fen >= 0),
+    price_conditions_json  TEXT NOT NULL DEFAULT '[]',
+    eligibility_json       TEXT NOT NULL DEFAULT '[]',
+    stock_status           TEXT NOT NULL DEFAULT 'unknown',
+    verification_status    TEXT NOT NULL CHECK (verification_status IN ('verified','conditional','unverified','stale')),
+    observed_at            TEXT NOT NULL,
+    created_at             TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS quote_matches (
+    evaluation_id  TEXT NOT NULL REFERENCES evaluations(id) ON DELETE CASCADE,
+    quote_id       TEXT NOT NULL REFERENCES new_price_quotes(id) ON DELETE CASCADE,
+    match_status   TEXT NOT NULL CHECK (match_status IN ('exact','equivalent_adjusted','incomparable','unknown')),
+    used_total_fen INTEGER,
+    new_total_fen  INTEGER,
+    saving_fen     INTEGER,
+    saving_ratio   TEXT,
+    PRIMARY KEY(evaluation_id, quote_id)
+);
+
+CREATE TABLE IF NOT EXISTS evaluation_feedback (
+    id             TEXT PRIMARY KEY,
+    evaluation_id  TEXT NOT NULL REFERENCES evaluations(id) ON DELETE CASCADE,
+    verdict        TEXT NOT NULL,
+    note           TEXT NOT NULL,
+    created_at     TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS products (
@@ -115,6 +288,10 @@ CREATE INDEX IF NOT EXISTS idx_observations_product   ON observations(product_id
 CREATE INDEX IF NOT EXISTS idx_observations_run_price ON observations(run_id, price_fen);
 CREATE INDEX IF NOT EXISTS idx_products_last_seen     ON products(last_seen_at);
 CREATE INDEX IF NOT EXISTS idx_runs_started           ON search_runs(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_research_run           ON research_runs(research_id, run_id);
+CREATE INDEX IF NOT EXISTS idx_analyses_observation_version ON text_analyses(observation_id, prompt_version, schema_version);
+CREATE INDEX IF NOT EXISTS idx_eval_profile_product   ON evaluations(profile_id, product_id, rule_version);
+CREATE INDEX IF NOT EXISTS idx_quotes_sku_observed_at ON new_price_quotes(sku_key, observed_at DESC);
 
 -- §6 关键语义：已入库老商品重新出现时仍属于本轮搜索结果。
 -- 用视图而非实表，避免双表重复储存没有用途的信息。

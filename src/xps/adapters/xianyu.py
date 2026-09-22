@@ -36,7 +36,7 @@ from xps.services.identity import resolve_identity
 
 logger = logging.getLogger(__name__)
 
-ADAPTER_VERSION = "xps-xianyu/0.2.0"
+ADAPTER_VERSION = "xps-xianyu/0.3.0"
 
 # 上游 checkout 位置；许可未确认，永不 vendor 进本仓库
 DEFAULT_UPSTREAM_PATH = Path(__file__).resolve().parents[3] / "upstream" / "xianyu_spider"
@@ -381,16 +381,20 @@ class XianyuUpstreamAdapter:
         has_next: bool | None = None
 
         for page in range(1, max_pages + 1):
+            if has_next is False:
+                outcomes.append(
+                    PageOutcome(
+                        page,
+                        False,
+                        (),
+                        outcome_kind="exhausted",
+                    )
+                )
+                break
+
             if page > 1:
                 # 逐页串行 + 节流，而不是上游那种 Semaphore(3) 并发
                 await asyncio.sleep(self._seconds_between_pages)
-
-            if has_next is False:
-                outcomes.append(
-                    PageOutcome(page, False, (), "NO_MORE_PAGES", "平台报告没有下一页")
-                )
-                warnings.append(f"page_{page}_not_available:hasNextPage=false")
-                continue
 
             try:
                 raw = await self._mtop.search(keyword, page, filters=filters)

@@ -1,84 +1,381 @@
-# 闲鱼本地商品搜索与价格统计服务
+# Best Price：给用户和 Agent 使用的本地购买研究服务
 
-单平台（闲鱼）本地 MVP。真实搜索 → 商品去重入库 → 平台字段清洗后原样透传 → **未筛选**的在售报价算术 → 可追溯 API。
-**只监听 `127.0.0.1`**，不分发、不商用。版本 `0.2.0`（`GET /health` 可查）。
+Best Price 是一个运行在你自己电脑上的 API 服务，帮助你搜索闲鱼商品、保存原始挂牌、
+比较同款二手报价，并让 Agent 进一步完成型号研究、商品评估和新旧价格对照。
 
-父规范：[`Xianyu_Agent_Price_Service_Implementation_Guide.md`](./Xianyu_Agent_Price_Service_Implementation_Guide.md)
-设计决策与 Gate A 实测证据：[`docs/superpowers/specs/2026-09-22-xianyu-price-service-design.md`](./docs/superpowers/specs/2026-09-22-xianyu-price-service-design.md)
-实施结论与阻塞项：[`IMPLEMENTATION_REPORT.md`](./IMPLEMENTATION_REPORT.md)
+当前版本：`0.4.0`。默认只监听 `127.0.0.1:8765`，数据保存在本机 SQLite，适合个人购物研究；
+不面向公网部署，不用于高频采集或商业分发。
 
----
+## 这份手册能帮你做什么
 
-## ⚠️ 先读：价格口径与红线
+- [安装、配置与启动服务](#安装配置与启动服务)
+- [部署为长期运行的本地服务](#部署与日常运维)
+- [使用命令行或 HTTP API](#用户怎么使用)
+- [让 Agent 和 Skill 使用服务](#让-agent-使用-best-price)
+- [了解当前功能与限制](#功能全景)
+- [排查登录和 API 问题](#登录可选)
 
-- 返回的是**采集时刻的公开在售报价**。**不是成交价**，不含国补、议价结果。
-  若平台打了券标签（`price.coupon_text`，如「券已抵50元」），**展示价可能已扣券** —— 原文一并透出。
-- **本服务不做任何相关性筛选。** 闲鱼挂牌里混着大量**租赁盘**（实测 ¥40–50/天）、**求购盘**、
-  **配件**、**定金占位链接**、**拍卖起拍价**、**广告位**，它们**全部照常入库、照常进入算术**。
-  `/v1/stats` 的 `sample_quality` 因此**恒含 `unfiltered`**，转述时不得省略。
-- 判断哪条商品可比，是**调用方（agent）的责任**。为此 `/v1/products` 透出了足够字段：
-  完整挂牌描述（保留换行分段）、卖家信用、好评率与评价数、卖家地址、想要人数、券抵扣、
-  包邮/严选/验货宝徽标、拍卖与广告标记。见「服务端不筛选」一节。
-- 采集失败**不会**退化成 `200 + []`。空列表只表示经核验的真实无结果（平台自报 `hasItems=false`）。
-- **不靠图片推断未公开的参数**，也不用大模型补齐规格。字段缺失就是 `null`，不填「暂无」占位。
-- 金额内部一律**人民币分（整数）**，API 以保留两位的字符串返回。全链路无 float。
-
----
-
-## 环境要求
-
-| 项 | 要求 | 本项目实测 |
-|---|---|---|
-| 系统 | macOS / Linux（Windows 需自行换算 PowerShell） | macOS 26.6.2, Darwin arm64 |
-| Python | ≥ 3.10（上游要求）；建议 3.12 | CPython 3.12.13（由 uv 管理） |
-| uv | 需要 | `~/.local/bin/uv` |
-| Playwright Chromium | **搜索不需要**，仅扫脸核身时才需要 | 未安装 |
-
-系统自带的 `python3` 可能是 3.9（不满足上游要求），`scripts/setup.sh` 会用 uv 拉 3.12。
-
----
-
-## 快速开始
+如果只想尽快用起来，完成下面三步即可：
 
 ```bash
-# 1. 初始化：建 venv、clone 上游、装依赖（幂等，可重复运行）
 scripts/setup.sh
-
-# 2. 启动服务（默认 127.0.0.1:8765）
 scripts/start-local.sh
-
-# 3. 另开一个终端，一条命令拿结果（会真的请求闲鱼，请保持低频）
+# 另开一个终端
 scripts/query-price.sh "富士 X-T4" --pages 2
-scripts/query-price.sh "RTX 4090" --pages 2      # 任意品类，同一套用法
+```
 
-# 离线测试（不打网络）
+> `query-price.sh` 会真实访问闲鱼。请保持低频；遇到登录、验证码或限流提示时停止自动操作，
+> 按错误信息完成必要的人工处理。
+
+---
+
+## 功能全景
+
+| 能力 | 现在能做什么 | 使用入口 |
+|---|---|---|
+| 闲鱼搜索 | 按关键词、价格范围、排序和有限页数搜索；记录每次 run 的状态和来源 | `POST /v1/search`、`query-price.sh` |
+| 原始商品数据 | 保存完整描述、挂牌价、卖家公开信息、地区、主图、包邮、拍卖/广告等信号 | `GET /v1/products` |
+| 原始价格统计 | 计算当前 run 的最低价、分位数、中位数、最高价与样本质量 | `GET /v1/stats` |
+| 任务调度 | 合并重复查询、复用短期缓存、限制队列、跨重启保留冷却/人工阻断状态 | 搜索 API 自动处理 |
+| 购买研究 | 支持指定型号、品类探索、具体挂牌核查三种模式；保存预算、约束、候选池和停止原因 | `/v1/researches*` |
+| 文本分析 | 默认用保守规则提取配件、租赁、定金、故障等原文证据；可选接入兼容模型 | `POST /v1/text-analyses` |
+| 商品评估 | 保存五维评分、证据覆盖度、风险、人工反馈和评分版本 | `/v1/evaluations*` |
+| 可比二手价 | 只对 Agent 已确认的同 SKU、同配置商品去重统计，不污染原始统计 | `GET /v1/researches/{id}/comparable-stats` |
+| 新旧价格对比 | 导入有 URL、时间、SKU 和条件的新品报价；成本完整时计算节省额和比例 | `/v1/new-prices*`、quote match |
+| 结果分组 | 分开返回型号层和挂牌层的 Primary、Extra、Review、Excluded | `GET /v1/researches/{id}/ranked` |
+| Agent 自助发现 | 返回实际端点、配置状态、错误恢复方式和当前降级能力 | `/help`、`/openapi.json`、`/v1/capabilities` |
+
+Best Price 的特色是：**原始事实、可比性判断和购买建议分层保存**。它不会为了给出一个“漂亮答案”
+而改写原始挂牌，也不会把 AI 推断冒充平台事实。每个研究结果都可以追溯到 run、商品链接、
+采集时间、证据、规则版本和新品报价来源。
+
+### 当前明确限制
+
+- 自动采集平台目前只有闲鱼；京东、淘宝、天猫、拼多多自动适配器尚未通过真实账号和许可证闸门。
+- 新品价格可以通过 Quote Import 导入，但 Mock/Dry-run 报价会被拒绝。
+- 云端文本模型默认关闭；关闭时规则分析、原始搜索和价格统计仍可正常使用。
+- 闲鱼搜索结果本身可能包含租赁、求购、配件、定金链接、拍卖起拍价和广告位。
+- 搜索响应目前只有主图，不把未取得的多图或商品规格编造出来。
+- 服务默认仅供本机访问；不要直接把端口暴露到公网。
+
+---
+
+## 安装、配置与启动服务
+
+### 1. 环境要求
+
+| 项 | 要求 |
+|---|---|
+| 系统 | macOS 或 Linux；Windows 需要自行换算 PowerShell 命令 |
+| Git | 用于拉取 Best Price 和独立的闲鱼上游采集器 |
+| uv | 用于创建 Python 3.12 虚拟环境和安装依赖 |
+| Python | 建议 3.12；`setup.sh` 会交给 uv 管理 |
+| Chromium | 普通搜索不需要；只有人工扫脸核身时才需要 |
+
+首次安装：
+
+```bash
+git clone https://github.com/Arragon/best-price.git bestprice
+cd bestprice
+scripts/setup.sh
+```
+
+`setup.sh` 会创建 `.venv`、安装项目依赖、把闲鱼采集器放入 gitignored 的 `upstream/`
+独立目录，并记录上游 commit。脚本是幂等的，可以重复运行。
+
+### 2. 创建配置
+
+不改配置也能以安全默认值启动。需要定制时：
+
+```bash
+cp .env.example .env
+```
+
+常用配置：
+
+| 环境变量 | 默认值 | 作用 |
+|---|---:|---|
+| `APP_HOST` | `127.0.0.1` | API 监听地址 |
+| `APP_PORT` | `8765` | API 端口 |
+| `DATABASE_PATH` | `./data/price.sqlite3` | SQLite 数据库位置 |
+| `MAX_SEARCH_PAGES` | `3` | 单次搜索允许的最大页数 |
+| `MIN_SECONDS_BETWEEN_SEARCHES` | `30` | 兼容旧部署的全局搜索间隔下限 |
+| `SECONDS_BETWEEN_PAGES` | `3` | 同一次搜索的分页间隔 |
+| `MAX_PENDING_JOBS` | `12` | 本地等待队列上限 |
+| `SEARCH_CACHE_TTL_SECONDS` | `600` | 成功 run 的本地复用时间 |
+| `MIN_SAMPLE_THRESHOLD` | `8` | 低于该样本量时标记证据不足 |
+| `LOG_FILE` | `./data/logs/bestprice.log` | 有界轮转日志位置 |
+| `LOG_MAX_BYTES` / `LOG_BACKUP_COUNT` | `5242880` / `3` | 单日志大小和保留份数 |
+| `AI_ENABLED` | `false` | 是否启用兼容 OpenAI API 的文本分析模型 |
+| `AI_BASE_URL` / `AI_MODEL` | 见 `.env.example` | 模型服务地址和模型名 |
+| `AI_API_KEY` | 空 | 只允许放在本机 `.env`，不要写入 Git 或聊天 |
+
+完整配置及注释见 [`.env.example`](./.env.example)。`pace=fast` 只是任务偏好；默认情况下仍受
+`MIN_SECONDS_BETWEEN_SEARCHES` 保护。只有明确启用 `ALLOW_FASTER_PACE=true` 后才采用更快档位，
+并且永远不能越过 `PLATFORM_FLOOR_SECONDS`、冷却状态或人工验证状态。
+
+启用可选文本模型时，只在本机 `.env` 中填写：
+
+```dotenv
+AI_ENABLED=true
+AI_BASE_URL=https://你的兼容服务/v1
+AI_MODEL=你的模型名
+AI_API_KEY=你的本机密钥
+```
+
+模型必须提供 OpenAI-compatible Chat Completions 接口。配置错误或模型不可用时，文本分析会明确
+降级到规则结果，不会让原始搜索失败；模型输出的每个标签仍必须引用挂牌原文。
+
+### 3. 启动并检查
+
+```bash
+scripts/start-local.sh
+```
+
+服务以前台单进程运行。看到监听地址后，另开终端检查：
+
+```bash
+curl -sS http://127.0.0.1:8765/health
+curl -sS http://127.0.0.1:8765/v1/capabilities
+curl -sS http://127.0.0.1:8765/help
+```
+
+常用页面：
+
+- 交互式 API 文档：<http://127.0.0.1:8765/docs>
+- OpenAPI：<http://127.0.0.1:8765/openapi.json>
+- Agent 使用说明：<http://127.0.0.1:8765/help?format=text>
+
+按 `Ctrl+C` 可以安全停止。不要同时启动多个实例写同一个 SQLite 数据库；服务的正确部署模型是
+**一个进程、一个 worker、一个数据库**。
+
+---
+
+## 部署与日常运维
+
+### 推荐部署方式
+
+本项目推荐部署在拥有数据和登录状态的那台 Mac/Linux 主机上：
+
+```text
+用户或 Agent
+    ↓ 本机 HTTP / SSH 或 Tailscale 隧道
+Best Price（单进程，127.0.0.1:8765）
+    ↓
+SQLite + 独立上游采集器
+```
+
+- 日常启动命令始终是 `scripts/start-local.sh`。需要长期运行时，把这个脚本交给 launchd、systemd
+  或你已有的进程管理器；工作目录必须是仓库根目录，实例数必须保持为 1。
+- 默认监听 loopback。跨设备访问优先使用 SSH 端口转发或 Tailscale，不建议直接监听公网。
+- 如果确实修改为非 loopback 地址，必须显式配置 `ALLOW_REMOTE_ACCESS=true`；这只解除启动保护，
+  **不等于服务已经具备公网鉴权、TLS 或防火墙**。
+- 运行日志写入 `data/logs/bestprice.log` 并自动轮转。数据库、日志、登录状态和 `.env` 均不应提交 Git。
+
+升级或修改 schema 前先备份：
+
+```bash
+scripts/backup-sqlite.sh
+git pull --ff-only
+scripts/setup.sh
+# 再由你的进程管理器重启，或重新运行 scripts/start-local.sh
+```
+
+备份使用 SQLite `VACUUM INTO`，随后立即检查完整性和核心表行数；不会覆盖已有备份文件。
+
+离线验收不会访问闲鱼：
+
+```bash
 .venv/bin/python -m pytest -q
 ```
 
-`scripts/query-price.sh` 是**给 agent 用的推荐入口**：它把 `POST → 轮询 → stats → products`
-四步、超时和错误分诊封成一条命令，输出里强制带上口径声明、**「样本未筛选」声明**、样本量、
-无价条目分组（`unpriced_by_status`）、拍卖/广告计数、采集质量限制和可追溯链接 ——
-调用方没法只报一个中位数就走。每条最低价样本旁边还会打上卖家信用、好评率与券抵扣。
-退出码：`0` 成功 / `2` 服务或参数问题 / `3` 采集失败 / `4` 轮询超时。
+真实 smoke 会访问平台，只在你明确需要时运行：
 
-参数：`--pages N`(≤ `MAX_SEARCH_PAGES`，默认 3)、`--sort newest|price_asc|price_desc|default`、
-`--min-price` / `--max-price`、`--top N`、`--timeout`、`--poll-interval`、`--base-url`。
-**没有 `--kind`**：相关性筛选已整体移除。
+```bash
+scripts/smoke-local.sh "富士 X-T4" 1
+RUN_ID=<已有run_id> scripts/smoke-local.sh "富士 X-T4" 1  # 复用结果，不重新请求
+```
 
-想看原始 HTTP 交互或做更细的调试，用 `scripts/smoke-local.sh "富士 X-T4" 2`
-（`RUN_ID=<已完成的run> scripts/smoke-local.sh …` 可复用已有 run，不重复打平台）。
+---
 
-交互式 API 文档：启动后访问 <http://127.0.0.1:8765/docs>，或 `GET /openapi.json`。
+## 用户怎么使用
+
+### 最简单：一条命令查询
+
+```bash
+scripts/query-price.sh "富士 X-T4" --pages 2
+scripts/query-price.sh "RTX 4090" --pages 1 --min-price 2000
+scripts/query-price.sh "27寸 4K 144Hz 显示器" --pace economy
+```
+
+保存完整 JSON，适合交给 Agent 或后续分析：
+
+```bash
+scripts/query-price.sh "富士 X-T4" \
+  --pages 2 --format json --output /tmp/x-t4.json
+```
+
+恢复一次已提交或超时的任务，不重新访问平台：
+
+```bash
+scripts/query-price.sh --reuse-run <run_id> --format json
+```
+
+常用参数：
+
+| 参数 | 作用 |
+|---|---|
+| `--pages N` | 闲鱼采集页数，不超过 `MAX_SEARCH_PAGES` |
+| `--sort` | `newest`、`price_asc`、`price_desc` 或 `default` |
+| `--min-price` / `--max-price` | 价格范围，单位为元 |
+| `--pace` | `economy`、`balanced` 或 `fast`，不绕过安全下限 |
+| `--force-refresh` | 跳过结果缓存，但仍受节流和人工阻断限制 |
+| `--reuse-run` | 读取已有 run，不重新搜索 |
+| `--format json` | 自动遍历本地分页，输出所有商品和完整描述 |
+| `--output FILE` | 把报告或 JSON 保存到文件 |
+| `--timeout` | 控制客户端等待时长；超时后仍可用 run_id 恢复 |
+
+退出码：`0` 成功、`2` 服务或参数问题、`3` 采集失败、`4` 等待超时。
+
+### 直接使用 HTTP API
+
+单次查询的基本流程：
+
+```text
+POST /v1/search
+  → GET /v1/search-runs/{run_id} 轮询
+  → GET /v1/products?run_id=...
+  → GET /v1/stats?run_id=...
+```
+
+购物研究流程会在此基础上增加：
+
+- `POST /v1/researches`：创建指定型号、品类探索或具体挂牌核查任务。
+- `POST /v1/researches/{id}/runs`：关联搜索 run 并消耗声明的研究预算。
+- `POST /v1/researches/{id}/candidates`：记录用户指定、Agent 提议或市场发现的型号。
+- `POST /v1/text-analyses`：提取带原文证据的商品类型、价格和风险信号。
+- `POST /v1/evaluations`：保存可重放的挂牌评估。
+- `GET /v1/researches/{id}/comparable-stats`：计算同 SKU 可比二手挂牌分布。
+- `POST /v1/new-prices/quotes`：导入可追溯的新品报价。
+- `POST /v1/evaluations/{id}/quote-match`：确认 SKU 关系并计算新旧总成本价差。
+- `GET /v1/researches/{id}/ranked`：读取型号层和挂牌层分组结果。
+
+下面的 [API](#api) 章节包含请求、响应、分页、价格口径和错误码的完整说明。
+
+---
+
+## 让 Agent 使用 Best Price
+
+Agent 可以直接调用命令行/API，也可以使用项目自带 Skill。推荐使用 Skill，因为它会约束 Agent：
+先确认用户需求和请求预算，再查询；区分原始统计与可比统计；保留证据、链接和不确定性；遇到登录、
+验证码或限流立即停止。
+
+### 方式一：在本仓库中使用项目 Skill
+
+主 Skill 位于 [`.agents/skills/best-price/SKILL.md`](./.agents/skills/best-price/SKILL.md)。
+支持项目级 Skill 的 Agent 在打开本仓库后会自动发现它。可以直接这样说：
+
+```text
+使用 best-price Skill，帮我调查 3000 元左右适合旅行航拍的二手无人机。
+预算不是硬上限，可以给少量 Extra；最多搜索 6 次，慢慢找。
+```
+
+或者显式触发：
+
+```text
+$best-price 帮我检查这条闲鱼 X-T4 挂牌是否值得买，并对照同配置新品。
+```
+
+旧客户端如果仍发现 `price-parser`，它只会引导到新的 `best-price` Skill。
+
+### 方式二：让其他 Agent 读取 Skill
+
+如果 Agent 客户端不支持 `.agents/skills/` 自动发现，把下面这句话作为任务的一部分：
+
+```text
+先完整读取 .agents/skills/best-price/SKILL.md，只按当前 /help、/openapi.json 和
+/v1/capabilities 中实际存在的能力执行；不要根据 README 猜测端点。
+```
+
+需要跨项目复用时，再按具体客户端支持的用户级 Skill 目录安装整个
+`.agents/skills/best-price/` 文件夹，不能只复制 `SKILL.md`，因为它还会按需读取
+`references/` 和 `assets/`。安装后应让客户端列出可用 Skill，确认 `best-price` 已被发现。
+
+### Agent 开始任务前应做什么
+
+```bash
+curl -sS http://127.0.0.1:8765/health
+curl -sS http://127.0.0.1:8765/v1/capabilities
+curl -sS "http://127.0.0.1:8765/help?format=text"
+```
+
+这三步分别确认服务在线、外部能力是否已配置，以及当前端点、错误处理和报告纪律。
+OpenAPI 是最终接口事实来源；README 和 Skill 负责说明正确工作方法。
+
+### 怎样让 Agent 更高效
+
+给 Agent 的任务里尽量明确以下信息：
+
+1. **任务模式**：指定型号、品类探索，还是检查一条具体挂牌。
+2. **预算含义**：目标预算还是硬上限；例如“约 3000”与“最多 3000”不同。
+3. **硬条件与偏好**：必须满足什么、哪些可以妥协、是否接受替代型号和 Extra。
+4. **研究预算**：允许多少次闲鱼请求、每次最多几页、使用 `economy/balanced/fast` 哪个节奏。
+5. **新品偏好**：例如“二手只便宜 10% 以内时优先考虑新品”。
+6. **输出要求**：要求 Primary/Extra/Review 分组、链接、采集时间、样本量、风险和待人工核实项。
+
+一个高质量提示词示例：
+
+```text
+使用 best-price Skill 调研 3000 元左右的二手无人机，主要用于旅行航拍。
+硬上限 3500，必须功能正常并能完整起飞拍摄；便携和续航是偏好，允许推荐老旗舰。
+最多 8 次闲鱼请求，每个关键词最多 2 页，pace=balanced。先做宽泛发现，再聚焦值得研究的型号。
+同配置二手只比可核验新品便宜 10% 以内时提醒我考虑新品。
+最终把型号判断和具体挂牌分开，输出 Primary、Extra、Review、来源链接、样本时间、停止原因和未验证信息。
+```
+
+提高效率的关键不是让 Agent 高频请求，而是：优先复用缓存和已有 run；先用宽泛词发现候选，
+再对少量高价值型号做聚焦搜索；拿到数据后尽量在本地完成文本分析、去重和评估；超时后使用
+`--reuse-run` 恢复，不重复提交同一查询。
+
+### Agent 与 API 的职责边界
+
+- API 负责采集、持久化、节流、来源、算术、证据校验和可重放的派生记录。
+- Agent 负责理解用户需求、规划关键词、识别同款/同配置、调查型号知识和形成购买建议。
+- 文本模型只负责结构化提取明确写在挂牌里的事实，不负责决定商品真假或替用户做最终选择。
+- 用户负责登录、验证码、支付、联系卖家和最终交易决定；这些操作不会被自动化。
+
+---
+
+## 价格口径与安全红线
+
+- 返回的是**采集时刻的公开在售报价**，不是成交价，也不自动包含国补或议价结果。
+- `/v1/stats` 是**未筛选统计**；`sample_quality` 恒含 `unfiltered`。租赁、配件、求购、
+  定金、拍卖和广告只要价格可解析，就会出现在原始算术中。
+- 判断商品是否可比，需要读取完整描述、SKU、套装、状态和卖家公开信息；使用研究级
+  `comparable-stats` 时必须先由 Agent 提交证据化评估。
+- 采集失败不会伪装成 `200 + []`。字段缺失保持 `null`，不会补成“暂无”或让 AI 猜测。
+- 金额内部一律以人民币分的整数保存；API 同时提供整数分和两位小数字符串。
+- 不绕过登录、验证码、访问限制或平台风控，不轮换账号/IP继续采集。
+- 不要把 Cookie、密码、短信验证码或 API Key 发给 Agent，也不要写入 URL、日志或 Git。
 
 ### 备份
 
 ```bash
-scripts/backup-sqlite.sh                       # 自动时间戳，落 data/backups/
+scripts/backup-sqlite.sh
 scripts/backup-sqlite.sh /tmp/before-upgrade.sqlite3
 ```
 
-用 `VACUUM INTO`（SQLite ≥ 3.27）而非裸拷主库文件 —— WAL 模式下裸拷会得到不完整快照。
-备份后立即 `PRAGMA integrity_check` 并核对行数；**目标文件已存在时拒绝覆盖**，不会悄悄毁掉上一份可用备份。
+数据默认位于 `data/`，该目录已被 Git 忽略。自动清理目前未启用；被研究、评估或报价引用的
+记录需要保留。商品图片只保存远程 URL，不会默认下载到本机。
+
+### 进一步文档
+
+- [架构与边界](./docs/architecture.md)
+- [长期维护知识](./docs/know-how.md)
+- [优化完成状态](./docs/optimization/status.md)
+- [外部能力闸门](./docs/optimization/external-gates.md)
+- [实施报告](./IMPLEMENTATION_REPORT.md)
+- [原始实施指南](./Xianyu_Agent_Price_Service_Implementation_Guide.md)
 
 ---
 
@@ -149,7 +446,7 @@ curl -sS http://127.0.0.1:8765/                     # 根路径指路，不会 4
   `must_not` 里明确禁止把 `stats` 的分布说成已清洗过的结果
 - **透传字段清单**（`passthrough` 段）—— 分「平台原话」/「本服务解析结果」/「拿不到」三类，
   逐字段说明语义。「拿不到」里写明了多图为什么拿不到（见下文实测结论），省得调用方试错撞墙
-- **错误码 → 行动指引** —— 12 个错误码各自带 `http_status` / `retryable` /
+- **错误码 → 行动指引** —— 当前 22 个错误码各自带 `http_status` / `retryable` /
   `requires_human_action` / `agent_action`，告诉调用方**下一步该做什么**，而不只是发生了什么
 
 `/help` 不会与实际 API 漂移：端点清单从 `app.openapi()` 派生，请求字段清单从
@@ -187,14 +484,16 @@ GET /v1/stats?run_id=...       未筛选的中位数 / 分位数 / 样本量
 ```bash
 curl -sS -X POST http://127.0.0.1:8765/v1/search \
   -H 'Content-Type: application/json' \
-  -d '{"keyword":"RTX 4090","max_pages":1,"sort":"newest"}'
+  -d '{"keyword":"RTX 4090","max_pages":1,"sort":"newest","pace":"balanced","cache_policy":"prefer_fresh"}'
 ```
 
 ```json
 {
   "run_id": "026babbc-6e7e-4db0-bb83-691805172f64",
   "status": "pending",
-  "status_url": "/v1/search-runs/026babbc-6e7e-4db0-bb83-691805172f64"
+  "status_url": "/v1/search-runs/026babbc-6e7e-4db0-bb83-691805172f64",
+  "reused": false,
+  "cache_hit": false
 }
 ```
 
@@ -204,12 +503,18 @@ curl -sS -X POST http://127.0.0.1:8765/v1/search \
 | `max_pages` | 默认 1，上限 `MAX_SEARCH_PAGES`（默认 3） |
 | `sort` | `newest`(默认) / `price_asc` / `price_desc` / `default`，对齐上游实测 `SORT_OPTIONS` |
 | `min_price_yuan` / `max_price_yuan` | Decimal 字符串，≥ 0，min ≤ max |
+| `pace` | `economy` / `balanced`(默认) / `fast`；偏好，不能越过服务端硬下限或风控状态 |
+| `cache_policy` | `prefer_fresh`(默认) / `force_refresh`；强刷也不绕节流 |
+| `idempotency_key` | 可选客户端追踪键；结果去重仍以规范化请求指纹为准 |
 | `city` / `province` / `publish_days` | 上游 `SearchFilters` 支持，但**平台是否真过滤未经实测**，传非 null 一律 `422 UNSUPPORTED_FILTER`，不暗称已过滤 |
 
 **没有 `item_kind`**（旧版的单机身/套机筛选已移除）。请求体是 `extra="forbid"`，
 传它会得到 `422 INVALID_QUERY`，不会被静默忽略。
 
-任务生命周期：单实例串行锁 + 应用内异步任务，**所有状态落库**。进程崩溃重启后，遗留的
+相同运行中请求返回同一 `run_id`；近期成功请求默认复用原 run 并返回 `cache_hit=true`。
+队列达到 `MAX_PENDING_JOBS` 时返回 `429 QUEUE_FULL`，不会向平台发请求。任务生命周期：
+单实例串行锁 + 应用内异步任务，**所有状态落库**。平台正常末页返回 `exhausted=true`，不再
+误报 `partial`。进程崩溃重启后，遗留的
 `pending`/`running` 会被判定为 `failed` + `RUN_INTERRUPTED`，不会永远挂着。
 
 ### `GET /v1/search-runs/{run_id}`
@@ -352,7 +657,7 @@ curl -sS "http://127.0.0.1:8765/v1/stats?run_id=<RUN>"
 
 ```bash
 curl -sS http://127.0.0.1:8765/health
-# {"status":"ok","database":"ok","version":"0.2.0","adapter":"XianyuUpstreamAdapter"}
+# {"status":"ok","database":"ok","version":"0.4.0","adapter":"XianyuUpstreamAdapter"}
 
 curl -sS http://127.0.0.1:8765/v1/auth/status
 # {"state":"guest","requires_human_action":false,"verified":false,
@@ -619,7 +924,7 @@ run_items     视图 = SELECT run_id, product_id FROM observations
 `products.title_latest` 与 `products.canonical_url` 改为可空 —— 平台未给标题时存 `NULL`，
 不填「暂无」；身份不可信的条目 `canonical_url` 为 `NULL`，但保留记录以便追溯。
 
-### `SCHEMA_VERSION = 2`（2026-09-22 迁移）
+### `SCHEMA_VERSION = 2`（2026-09-22 增量迁移）
 
 `observations` **新增 15 列**，用来落地上文的透传字段：
 `description`、`original_price_text`、`coupon_text`、`seller_credit`、`seller_review_count`、
@@ -641,6 +946,20 @@ SQLite 删列要重写整表，为几列死数据冒这个险不值当；代码�
 - **332 个 products / 419 个 observations 全部保留**，行数迁移前后一致
 - 重复执行无副作用（`ALTER TABLE ADD COLUMN` 前先查 `PRAGMA table_info`）
 - 老 run 仍能正常读出；老行的新字段为 `NULL` —— 这是诚实的，那些字段当时没采集
+
+### `SCHEMA_VERSION = 3`（2026-09-23 增量迁移）
+
+- `search_runs.request_fingerprint`：运行中合并与近期成功 run 缓存复用。
+- `search_runs.exhausted`：平台正常末页的明确状态，不与失败页混淆。
+- `scheduler_state`：跨重启保留最后平台请求、限流冷却和人工处理停止状态。
+
+迁移仍为加法、可重复执行；本次没有改写既有 product/observation 行。
+
+### `SCHEMA_VERSION = 4`（购买研究派生层）
+
+新增 researches/search_profiles/research_runs/model candidates、文本分析、挂牌评估与证据、
+风险、反馈、零售报价和 SKU 匹配表。所有表通过外键引用原始 run/product/observation；
+AI、评分和用户偏好不会写进 `products` 或 `observations`。
 
 改造前**先备份**：`scripts/backup-sqlite.sh`（`VACUUM INTO` + 立即 `integrity_check` + 核对行数，
 目标文件已存在时拒绝覆盖）。
@@ -713,6 +1032,13 @@ httpx.Client(base_url="http://127.0.0.1:8765", trust_env=False)   # 只连本机
 **实际运行记录**（禁止在无证据时声称「测试通过」，指南 §11）：
 
 ```text
+日期    2026-09-23（完整优化 Phase 0–6）
+环境    macOS arm64 / CPython 3.12.13 / pytest 9.1.1
+
+命令    .venv/bin/python -m pytest -q
+结果    452 passed, 4 deselected（离线，未访问网络）
+        4 个 deselected 是显式标记的真实网络测试，默认不跑
+
 日期    2026-09-22（移除相关性筛选层之后）
 环境    macOS 26.6.2 (Darwin arm64) / CPython 3.12.13 / pytest 9.1.1 / fastapi 0.141.1
 
@@ -786,7 +1112,7 @@ src/xps/
 │   ├── identity.py       身份键与域名白名单
 │   └── statistics.py     inclusive 分位数、未筛选样本构成、sample_quality
 └── storage/
-    ├── db.py             连接/WAL/幂等加法迁移（SCHEMA_VERSION=2）/VACUUM INTO 备份
+    ├── db.py             连接/WAL/幂等加法迁移（SCHEMA_VERSION=4）/VACUUM INTO 备份
     ├── schema.sql
     └── repository.py
 scripts/   setup.sh start-local.sh login.sh query-price.sh smoke-local.sh

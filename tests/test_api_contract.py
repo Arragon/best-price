@@ -6,14 +6,17 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from decimal import Decimal
+from logging.handlers import RotatingFileHandler
 
 import pytest
 
-from xps.settings import Settings
 from tests.fake_adapter import FakeAdapter, body_listings, synthetic_listing
 from tests.helpers import build_client, search_and_wait, submit, wait_for_run
+from xps.main import configure_logging
+from xps.settings import Settings
 
 # ---------------------------------------------------------------- 提交与轮询
 
@@ -60,7 +63,7 @@ def test_price_filters_are_passed_as_decimal(client, adapter) -> None:
         {"keyword": "富士 X-T4", "min_price_yuan": "2500", "max_price_yuan": "6500.50"},
     )
 
-    assert adapter.calls[0]["min_price"] == Decimal("2500")
+    assert adapter.calls[0]["min_price"] == Decimal(2500)
     assert adapter.calls[0]["max_price"] == Decimal("6500.50")
 
 
@@ -638,6 +641,33 @@ def test_settings_refuse_concurrent_searches() -> None:
     """SQLite 单写者 + 低频访问平台；配错了要立刻炸，不能静默忽略。"""
     with pytest.raises(ValueError, match="max_concurrent_searches"):
         Settings(max_concurrent_searches=4, _env_file=None)
+
+
+def test_logging_uses_bounded_rotating_file(tmp_path, monkeypatch) -> None:
+    log_path = tmp_path / "logs" / "bestprice.log"
+    settings = Settings(
+        log_file=log_path,
+        log_max_bytes=1024,
+        log_backup_count=2,
+        _env_file=None,
+    )
+
+    captured = {}
+    monkeypatch.setattr(logging, "basicConfig", lambda **kwargs: captured.update(kwargs))
+    configure_logging(settings)
+    try:
+        rotating = [
+            handler
+            for handler in captured["handlers"]
+            if isinstance(handler, RotatingFileHandler)
+        ]
+        assert len(rotating) == 1
+        assert rotating[0].baseFilename == str(log_path)
+        assert rotating[0].maxBytes == 1024
+        assert rotating[0].backupCount == 2
+    finally:
+        for handler in captured["handlers"]:
+            handler.close()
 
 
 # ---------------------------------------------------------------- 采集来源可追溯
